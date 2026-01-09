@@ -5,25 +5,69 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
-class CondConv2d(nn.Module):
-    """
-    Conditionally Parameterized Convolution (CondConv).
-    Generates input-dependent convolution kernels by mixing multiple expert kernels.
-    Supports groups and bias=False as in the original model.
 
-    Reference: https://arxiv.org/pdf/1904.04971
+class TimeAwareRouter(nn.Module):
+    """
+    Computes expert routing weights using both image features and time embeddings.
+    Fuses content and time information via a lightweight MLP to adapt kernels dynamically.
+    Crucial for DDPM to handle different noise levels with specific expert combinations.
     """
     def __init__(self,
                  in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride=1,
-                 padding=0,
-                 groups=1,
-                 bias=False,
-                 num_experts=4,
-                 gating_noise_std=1e-2,):
-        super(CondConv2d, self).__init__()
+                 time_emb_dim,
+                 num_experts=4):
+        """
+        Args:
+            in_channels: Input dimension of pooled image features.
+            time_emb_dim: Input dimension of time embeddings.
+            num_experts: Number of experts to route to (default: 4).
+        """
+        super().__init__()
+
+        # Hidden dim 64 is a sweet spot: expressive enough for fusion, computationally cheap.
+        hidden_dim = 64
+
+        self.net = nn.Sequential(
+            # Fuse image content and time info
+            nn.Linear(in_channels + time_emb_dim, hidden_dim),
+            nn.GELU(),
+            # Output logits for each expert
+            nn.Linear(hidden_dim, num_experts)
+        )
+
+    def forward(self, x_pooled, time_emb):
+        """
+        Args:
+            x_pooled: Global average pooled features (B, C).
+            time_emb: Time step embeddings (B, T_dim).
+        Return:
+            Logits for expert selection (B, num_experts).
+        """
+        # Concatenate content features and time embedding
+        combined = torch.cat([x_pooled, time_emb], dim=1)
+        logits = self.net(combined)
+        return logits
+
+
+class TimeAwareCondConv2d(nn.Module):
+    """
+    Time-Aware CondConv: Dynamically aggregates expert kernels using both input features and time embeddings.
+    Allows the convolution to adapt its behavior based on the current diffusion timestep (t).
+    Maintains standard Conv2d interface while supporting groups and efficient batch processing.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 time_emb_dim: int,
+                 kernel_size: int,
+                 stride: int = 1,
+                 padding: int = 0,
+                 groups: int = 1,
+                 bias: bool = False,
+                 num_experts: int = 4,
+                 gating_noise_std: float = 1e-2, ):
+        super(TimeAwareCondConv2d, self).__init__()
         assert in_channels % groups == 0, "in_channels must be divisible by groups."
         assert out_channels % groups == 0, "out_channels must be divisible by groups."
 
@@ -46,8 +90,8 @@ class CondConv2d(nn.Module):
         else:
             self.register_parameter('bias', None)
 
-        # Routing network: global avg pool + FC + sigmoid
-        self.routing_fc = nn.Linear(in_channels, num_experts)
+        # Routing network: MLP taking both (AvgPooled Input + Time Embedding)
+        self.router = TimeAwareRouter(in_channels, time_emb_dim, num_experts)
 
         self._init_weights()
 
@@ -62,46 +106,52 @@ class CondConv2d(nn.Module):
 
         # Apply Kaiming normal initialization (applicable to GELU, as it is similar to ReLU)
         init.kaiming_normal_(temp_weight, a=0, mode='fan_in', nonlinearity='relu')
-        # temp_weight is the view of self.weight, modifying the view will update the original tensor
 
         if self.bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(temp_weight)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, time_emb) -> torch.Tensor:
         """
         Args:
-            x(torch.Tensor): Input Tensor
-        Return:
-            Tensor
+            x (Tensor): Input feature map [B, C, H, W].
+            time_emb (Tensor): Time embedding vector [B, D] indicating noise level.
+        Returns:
+            Tensor: Output feature map computed with time-adaptive kernels.
         """
         B, C, H, W = x.shape
 
-        # Compute per-input routing weights
+        # Compute per-input routing weights using global context
         pooled = F.avg_pool2d(x, (H, W)).view(B, C)  # [B, in_channels]
 
+        # Calculate routing weights based on Content + Time
         # [B, num_experts]
         if self.training:
-            gating_logits = self.routing_fc(pooled)
-            # In order to alleviate the experts' drowsiness during training and their inability to receive training.
+            gating_logits = self.router(pooled, time_emb)
+            # Add noise during training to encourage expert diversity
             noise = torch.randn_like(gating_logits) * self.gating_noise_std
-            routing_weights = torch.sigmoid(gating_logits + noise)
+            routing_weights = torch.tanh(gating_logits + noise)
         else:
-            routing_weights = torch.sigmoid(self.routing_fc(pooled))
+            routing_weights = torch.tanh(self.router(pooled, time_emb))
 
-        # Compute effective weights and biases
-        weight_eff = (routing_weights[:, :, None, None, None, None] * self.weight[None]).sum(1)  # [B, out, in//g, k, k]
+        # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
+        # weight_eff: [B, out, in//g, k, k]
+        weight_eff = (routing_weights[:, :, None, None, None, None] * self.weight[None]).sum(1)
+
+        # Compute effective bias if present
         if self.bias is not None:
             bias_eff = (routing_weights[:, :, None] * self.bias[None]).sum(1)  # [B, out]
         else:
             bias_eff = None
 
-        # Flatten for batched convolution
+        # Flatten batch and channels for grouped convolution trick
         x_flat = x.view(1, B * C, H, W)  # [1, B*in, H, W]
-        weight_flat = weight_eff.view(B * self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size)
+        weight_flat = weight_eff.view(B * self.out_channels, self.in_channels // self.groups, self.kernel_size,
+                                      self.kernel_size)
         groups = B * self.groups
 
+        # Apply convolution with unique kernel per sample
         out_flat = F.conv2d(
             x_flat, weight_flat, None, self.stride, self.padding, dilation=1, groups=groups
         )  # [1, B*out, H', W']
@@ -110,7 +160,7 @@ class CondConv2d(nn.Module):
         if bias_eff is not None:
             out_flat = out_flat + bias_eff.view(1, B * self.out_channels, 1, 1)
 
-        # Reshape back to [B, out, H', W']
+        # Reshape back to standard batch format [B, out, H', W']
         return out_flat.view(B, self.out_channels, out_flat.shape[2], out_flat.shape[3])
 
 
@@ -218,7 +268,7 @@ class DualPathBlock(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return CondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
@@ -351,8 +401,8 @@ class DualPathStage(nn.Module):
         num_blocks (int): Number of DualPathBlocks in this stage.
         dense_inc (int): Number of dense channels added by each block.
         groups (int): Number of groups for grouped convolutions.
-        use_condconv (bool): If True, uses CondConv2d for convolutions.
-        num_experts (int): Number of experts for CondConv2d.
+        use_condconv (bool): If True, uses TimeAwareCondConv2d for convolutions.
+        num_experts (int): Number of experts for TimeAwareCondConv2d.
         expansion_ratio (int): Expansion ratio for the inverted bottleneck.
     """
 
@@ -419,7 +469,7 @@ class DownsampleLayer(nn.Module):
                  out_channels,
                  dense_inc,
                  groups=1,
-                 use_condconv=False,
+                 use_condconv=True,
                  num_experts=4,):
         super(DownsampleLayer, self).__init__()
         assert in_channels % groups == 0, f"in_channels:{in_channels} must be divisible by groups:{groups}."
@@ -432,7 +482,7 @@ class DownsampleLayer(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return CondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
@@ -486,7 +536,7 @@ class Stem(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return CondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
