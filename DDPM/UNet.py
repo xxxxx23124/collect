@@ -461,6 +461,9 @@ class Stem(nn.Module):
     Args:
         in_channels: Input channels
         out_channels: Output channels after stem (matches first stage res_channels).
+        kernel_size: default 4 for classification
+        stride: default 4 for classification
+        padding: default 0 for classification
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
     """
@@ -468,6 +471,9 @@ class Stem(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels: int,
+                 kernel_size: int = 4,
+                 stride: int = 4,
+                 padding:int = 0,
                  use_condconv: bool = False,
                  num_experts: int = 4):
 
@@ -484,7 +490,7 @@ class Stem(nn.Module):
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
-        self.conv = make_conv(in_channels, out_channels, 4, s=4, p=0)
+        self.conv = make_conv(in_channels, out_channels, kernel_size, s=stride, p=padding)
         self.ln = ChannelLayerNorm(out_channels)
 
     def forward(self, x) -> torch.Tensor:
