@@ -123,6 +123,7 @@ class TimeAwareCondConv2d(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.time_emb_dim = time_emb_dim
         self.kernel_size = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
         self.stride = stride
         self.padding = padding
@@ -146,19 +147,22 @@ class TimeAwareCondConv2d(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Reshaping weights as [num_experts * out_channels, in_channels // groups, kernel_size, kernel_size]
-        temp_weight = self.weight.view(
-            self.num_experts * self.out_channels,
-            self.in_channels // self.groups,
-            self.kernel_size,
-            self.kernel_size
-        )
+        # 1. 计算 Fan_in
+        # 对于单个 Expert，它的感受野包含多少个输入参数
+        fan_in = (self.in_channels // self.groups) * (self.kernel_size ** 2)
 
-        # Apply Kaiming normal initialization (applicable to GELU, as it is similar to ReLU)
-        init.kaiming_normal_(temp_weight, a=0, mode='fan_in', nonlinearity='relu')
+        # 2. 计算 Kaiming Normal 所需的标准差
+        # 2.0 是针对 ReLU/GELU 类激活函数的增益系数 (Gain squared)
+        std = math.sqrt(2.0 / fan_in)
 
+        # 3. 直接对 5 维权重进行初始化
+        # 将每个专家 (Expert) 都初始化为一个独立的、合格的卷积核
+        nn.init.normal_(self.weight, mean=0.0, std=std)
+
+        # 4. 偏置 (Bias) 初始化
+        # 偏置通常初始化为 0，或者基于 fan_in 的均匀分布
         if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(temp_weight)
+            # 这里的 fan_in 其实应该用 fan_in_bias，通常等于 fan_in
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
 
@@ -313,14 +317,14 @@ class DualPathBlock(nn.Module):
         https://arxiv.org/pdf/2301.00808
     """
     def __init__(self,
-                 inc,
-                 res_channels,
-                 dense_inc,
-                 time_emb_dim,
-                 groups=32,
-                 use_condconv=True,
-                 num_experts=4,
-                 expansion_ratio=4,):
+                 inc: int,
+                 res_channels: int,
+                 dense_inc: int,
+                 time_emb_dim: int,
+                 groups: int=32,
+                 use_condconv: bool=True,
+                 num_experts: int=4,
+                 expansion_ratio: int=4,):
         super(DualPathBlock, self).__init__()
         assert res_channels % groups == 0, f"res_channels:{res_channels} must be divisible by groups:{groups}."
 
@@ -334,9 +338,19 @@ class DualPathBlock(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
             else:
-                return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
+                raise TypeError("This feature is not yet implemented.")
 
         self.ln = AdaCLN(inc, time_emb_dim)
         self.conv1 = make_conv(inc, res_channels, 1)
@@ -405,6 +419,7 @@ class DualPathBlock(nn.Module):
         """
         Args:
             x(torch.Tensor): Input Tensor
+            time_emb(torch.Tensor): Timestep Tensor
         Return:
             Tensor
         """
@@ -467,6 +482,7 @@ class DualPathStage(nn.Module):
         num_blocks (int): Number of DualPathBlocks in this stage.
         dense_inc (int): Number of dense channels added by each block.
         groups (int): Number of groups for grouped convolutions.
+        time_emb_dim(int): the dim from time network's output.
         use_condconv (bool): If True, uses TimeAwareCondConv2d for convolutions.
         num_experts (int): Number of experts for TimeAwareCondConv2d.
         expansion_ratio (int): Expansion ratio for the inverted bottleneck.
@@ -478,41 +494,46 @@ class DualPathStage(nn.Module):
                  num_blocks: int,
                  dense_inc: int,
                  groups: int,
+                 time_emb_dim: int,
                  use_condconv: bool = True,
                  num_experts: int = 4,
                  expansion_ratio: int = 4):
         super().__init__()
 
-        # Calculate initial dense channels from input and residual channels
         initial_dense = in_channels - res_channels
         assert initial_dense >= 0, "res_channels cannot be greater than in_channels."
 
         current_channels = in_channels
-        blocks = []
+
+        self.blocks = nn.ModuleList()
+
         for _ in range(num_blocks):
             block = DualPathBlock(
                 inc=current_channels,
                 res_channels=res_channels,
                 dense_inc=dense_inc,
+                time_emb_dim=time_emb_dim,
                 groups=groups,
                 use_condconv=use_condconv,
                 num_experts=num_experts,
                 expansion_ratio=expansion_ratio
             )
-            blocks.append(block)
+            self.blocks.append(block)
             current_channels += dense_inc
 
-        self.blocks = nn.Sequential(*blocks)
         self.out_channels = current_channels
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x(torch.Tensor): Input Tensor
+            time_emb(torch.Tensor): Timestep Tensor
         Return:
             Tensor
         """
-        return self.blocks(x)
+        for block in self.blocks:
+            x = block(x, time_emb)
+        return x
 
 
 class DownsampleLayer(nn.Module):
@@ -524,6 +545,7 @@ class DownsampleLayer(nn.Module):
         in_channels: Input channels (res_channels + dense_channels).
         out_channels: Output channels for residual path in next stage.
         dense_inc: Initial dense channels for next stage.
+        time_emb_dim(int): the dim from time network's output.
         groups: number of groups for grouped convolution.
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
@@ -531,12 +553,13 @@ class DownsampleLayer(nn.Module):
 
     """
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 dense_inc,
-                 groups=1,
-                 use_condconv=True,
-                 num_experts=4,):
+                 in_channels: int,
+                 out_channels: int,
+                 dense_inc: int,
+                 time_emb_dim:int,
+                 groups: int=1,
+                 use_condconv: bool=True,
+                 num_experts:int=4,):
         super(DownsampleLayer, self).__init__()
         assert in_channels % groups == 0, f"in_channels:{in_channels} must be divisible by groups:{groups}."
         assert (out_channels + dense_inc) % groups == 0, f"(out_channels:{out_channels} + dense_inc:{dense_inc}) must be divisible by groups:{groups}."
@@ -548,27 +571,38 @@ class DownsampleLayer(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
             else:
-                return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
+                raise TypeError("This feature is not yet implemented.")
 
-        self.ln = AdaCLN(in_channels)
+        self.ln = AdaCLN(in_channels, time_emb_dim)
         self.conv = make_conv(in_channels, out_channels + dense_inc, 2, s=2, p=0, g=groups)
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x(torch.Tensor): Input Tensor
+            time_emb(torch.Tensor): Timestep Tensor
         Return:
             Tensor
         """
-        def main_path(x_in):
-            return self.conv(self.ln(x_in))
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            return self.conv(self.ln(x_in, time_emb_in), time_emb_in)
 
         if self.training:
-            return checkpoint(main_path, x, use_reentrant=False)
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
         else:
-            return main_path(x)
+            return main_path(x, time_emb)
 
 class Stem(nn.Module):
     """
@@ -577,6 +611,7 @@ class Stem(nn.Module):
     Args:
         in_channels: Input channels
         out_channels: Output channels after stem (matches first stage res_channels).
+        time_emb_dim(int): the dim from time network's output.
         kernel_size: default 4 for classification
         stride: default 4 for classification
         padding: default 0 for classification
@@ -585,8 +620,9 @@ class Stem(nn.Module):
     """
 
     def __init__(self,
-                 in_channels,
+                 in_channels: int,
                  out_channels: int,
+                 time_emb_dim: int,
                  kernel_size: int = 4,
                  stride: int = 4,
                  padding:int = 0,
@@ -602,26 +638,37 @@ class Stem(nn.Module):
 
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
-                return TimeAwareCondConv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False, num_experts=num_experts)
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
             else:
-                return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
+                raise TypeError("This feature is not yet implemented.")
 
         self.conv = make_conv(in_channels, out_channels, kernel_size, s=stride, p=padding)
-        self.ln = AdaCLN(out_channels)
+        self.ln = AdaCLN(out_channels, time_emb_dim)
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x(torch.Tensor): Input Tensor
+            time_emb(torch.Tensor): Timestep Tensor
         Return:
             Tensor
         """
-        def stem_path(x_in):
-            out = self.conv(x_in)
-            out = self.ln(out)
+        def stem_path(x_in, time_emb_in):
+            out = self.conv(x_in, time_emb_in)
+            out = self.ln(out, time_emb_in)
             return out
 
         if self.training:
-            return checkpoint(stem_path, x, use_reentrant=False)
+            return checkpoint(stem_path, x, time_emb, use_reentrant=False)
         else:
-            return stem_path(x)
+            return stem_path(x, time_emb)
