@@ -6,46 +6,96 @@ import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
 
-class TimeAwareRouter(nn.Module):
+class TimeModulator(nn.Module):
     """
-    Computes expert routing weights using both image features and time embeddings.
-    Fuses content and time information via a lightweight MLP to adapt kernels dynamically.
-    Crucial for DDPM to handle different noise levels with specific expert combinations.
+    用于 AdaCLN 和 AdaGRN 的时间映射模块
+    结构: Linear -> GELU -> Linear
     """
-    def __init__(self,
-                 in_channels,
-                 time_emb_dim,
-                 num_experts=4):
-        """
-        Args:
-            in_channels: Input dimension of pooled image features.
-            time_emb_dim: Input dimension of time embeddings.
-            num_experts: Number of experts to route to (default: 4).
-        """
-        super().__init__()
 
-        # Hidden dim 64 is a sweet spot: expressive enough for fusion, computationally cheap.
-        hidden_dim = 64
+    def __init__(self, time_emb_dim, out_channels, gamma_init_value=0.0):
+        super().__init__()
+        assert out_channels % 2 == 0, "TimeModulator's out_channels must be even for two part [gamma, beta]"
+        self.out_channels = out_channels
+        self.gamma_init_value = gamma_init_value  # 保存期望的 gamma 初始值
 
         self.net = nn.Sequential(
-            # Fuse image content and time info
-            nn.Linear(in_channels + time_emb_dim, hidden_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
             nn.GELU(),
-            # Output logits for each expert
-            nn.Linear(hidden_dim, num_experts)
+            nn.Linear(time_emb_dim, out_channels)
         )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # 1. 最后一层的权重 weight 初始化为 0
+        # 这样 t (时间) 的变化在初始阶段不会造成剧烈的特征波动
+        nn.init.zeros_(self.net[-1].weight)
+
+        # 2. 最后一层的偏置 bias 进行特殊初始化
+        # 我们假设 out_channels 是 [gamma, beta] 的拼接
+        # 前一半是 gamma，后一半是 beta
+        half_dim = self.out_channels // 2
+
+        # 初始化 Gamma 部分 (Bias)
+        nn.init.constant_(self.net[-1].bias[:half_dim], self.gamma_init_value)
+
+        # 初始化 Beta 部分 (Bias) 始终为 0
+        nn.init.constant_(self.net[-1].bias[half_dim:], 0.0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TimeAttentionRouter(nn.Module):
+    def __init__(self, in_channels, time_emb_dim, num_experts=4):
+        super().__init__()
+
+        # 1. Q 映射 (Time)
+        self.to_q = nn.Linear(time_emb_dim, in_channels)
+        # 2. K 映射 (Content)
+        self.to_k = nn.Linear(in_channels, in_channels)
+        # 3. V 映射 (Content)
+        self.to_v = nn.Linear(in_channels, in_channels)
+
+        # 4. 通道混合矩阵 (如果想做通道间交互)
+        # 这是一个激进的设计：让通道之间可以相互说话
+        # 但参数量是 C*C，如果 C 很大要注意。这里用 reduction 降低风险
+        self.channel_mixer = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 4),
+            nn.GELU(),
+            nn.Linear(in_channels // 4, in_channels)
+        )
+
+        # 5. 最终分类器
+        self.classifier = nn.Linear(in_channels, num_experts)
 
     def forward(self, x_pooled, time_emb):
         """
-        Args:
-            x_pooled: Global average pooled features (B, C).
-            time_emb: Time step embeddings (B, T_dim).
-        Return:
-            Logits for expert selection (B, num_experts).
+        x_pooled: (B, C)
+        time_emb: (B, T_dim)
         """
-        # Concatenate content features and time embedding
-        combined = torch.cat([x_pooled, time_emb], dim=1)
-        logits = self.net(combined)
+        # 生成 Query (根据时间，我想要什么样的特征？)
+        q = self.to_q(time_emb)  # (B, C)
+
+        # 生成 Key (图像实际有什么特征？)
+        k = self.to_k(x_pooled)  # (B, C)
+
+        # 计算注意力分数 (Element-wise dot product -> Sigmoid)
+        # 这里实际上是计算：时间对每个通道的“关注度”
+        attn_weights = torch.sigmoid(q * k)  # (B, C)
+
+        # 应用注意力 (加权)
+        v = self.to_v(x_pooled)
+        x_attended = v * attn_weights  # (B, C)
+        # 此时 x_attended 已经被时间筛选过了：
+        # 如果是噪声阶段，attn_weights 可能抑制了高频纹理通道
+
+        # 通道混合 (Channel Mixing)
+        # 允许通道之间交换信息 (比如：看到了眼睛，也要激活鼻子的特征)
+        x_mixed = x_attended + self.channel_mixer(x_attended)
+
+        # 最终路由
+        logits = self.classifier(x_mixed)
         return logits
 
 
@@ -91,7 +141,7 @@ class TimeAwareCondConv2d(nn.Module):
             self.register_parameter('bias', None)
 
         # Routing network: MLP taking both (AvgPooled Input + Time Embedding)
-        self.router = TimeAwareRouter(in_channels, time_emb_dim, num_experts)
+        self.router = TimeAttentionRouter(in_channels, time_emb_dim, num_experts)
 
         self._init_weights()
 
@@ -164,63 +214,77 @@ class TimeAwareCondConv2d(nn.Module):
         return out_flat.view(B, self.out_channels, out_flat.shape[2], out_flat.shape[3])
 
 
-class ChannelLayerNorm(nn.Module):
+class AdaCLN(nn.Module):
     """
-    Channel-wise Layer Normalization as used in ConvNeXt.
-    Normalizes across channels for each spatial position.
+    Adaptive Channel Layer Norm (AdaCLN)
+    Replaces static weight/bias with time-dependent modulation.
     """
-    def __init__(self, num_channels, eps=1e-6):
+
+    def __init__(self, num_channels, time_emb_dim, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
-        self.eps = eps
-
-    def forward(self, x) -> torch.Tensor:
-        """
-        Args:
-            x(torch.Tensor): Input Tensor
-        Return:
-            Tensor
-        """
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None, None] * x + self.bias[:, None, None]
-        return x
-
-
-class GlobalResponseNorm(nn.Module):
-    """
-    Global Response Normalization (GRN) as introduced in ConvNeXt V2.
-    This normalization encourages competition among channels by amplifying
-    stronger responses and suppressing weaker ones, helping to prevent feature collapse.
-
-    Reference: https://arxiv.org/pdf/2301.00808
-    """
-
-    def __init__(self, num_channels: int, eps: float = 1e-6):
-        """
-        Args:
-            num_channels (int): Number of channels in the input tensor.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-        """
-        super(GlobalResponseNorm, self).__init__()
         self.num_channels = num_channels
         self.eps = eps
-        self.gamma = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 将时间嵌入映射为 Scale (gamma) 和 Shift (beta)
+        self.emb_layers = TimeModulator(time_emb_dim, 2 * num_channels, 0)
+
+    def forward(self, x, time_emb):
         """
-        Args:
-            x(torch.Tensor): Input Tensor
-        Return:
-            Tensor
+        x: (B, C, H, W)
+        time_emb: (B, T_dim)
         """
-        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)  # Shape: (B, C, 1, 1)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)  # Shape: (B, C, 1, 1)
-        x = self.gamma * (x * nx) + self.beta + x
-        return x
+        # 1. 计算 LayerNorm 的统计量 (Pixel-wise, across channels)
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x_norm = (x - u) / torch.sqrt(s + self.eps)
+
+        # 2. 获取动态参数
+        emb = self.emb_layers(time_emb)  # (B, 2*C)
+        gamma, beta = emb.chunk(2, dim=1)  # (B, C), (B, C)
+
+        # 3. 广播并应用 (Modulate)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        return x_norm * (1 + gamma) + beta
+
+
+class AttentiveAdaGRN(nn.Module):
+    def __init__(self, channels, time_emb_dim):
+        super().__init__()
+        # 这一部分用来生成 gamma 和 beta
+        # 输入不仅仅是 time，而是 time 和 pooled_x 的交互
+        self.time_proj = nn.Linear(time_emb_dim, channels)
+        self.content_proj = nn.Linear(channels, channels)
+
+        # 生成 gamma, beta
+        self.to_params = TimeModulator(channels, 2 * channels, 0)
+
+    def forward(self, x, time_emb):
+        # x: (B, C, H, W)
+        # 1. 标准 GRN 计算 (归一化部分)
+        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
+
+        # 2. 生成动态参数 (Attention 思想)
+        x_pooled = x.mean(dim=(2, 3))  # (B, C)
+
+        # Q-K 交互：时间 Q 调节 内容 K
+        # 这里的交互方式：简单相加或相乘，然后过 MLP
+        t_vec = self.time_proj(time_emb)
+        c_vec = self.content_proj(x_pooled)
+
+        # 融合向量：结合了“现在的噪声水平”和“现在的图像语义”
+        context = t_vec * c_vec
+
+        # 映射为参数
+        params = self.to_params(context)
+        gamma, beta = params.chunk(2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        # 3. 应用
+        return gamma * (x * nx) + beta + x
 
 class DualPathBlock(nn.Module):
     """
@@ -237,6 +301,7 @@ class DualPathBlock(nn.Module):
         inc: total input channels (res_channels + dense_channels)
         res_channels: channels for the residual path (fixed per stage)
         dense_inc: additional channels to add to the dense path
+        time_emb_dim: the dim from time network's output
         groups: number of groups for grouped convolution
         use_condconv: whether to use CondConv for convolutions
         num_experts: number of experts for CondConv
@@ -251,6 +316,7 @@ class DualPathBlock(nn.Module):
                  inc,
                  res_channels,
                  dense_inc,
+                 time_emb_dim,
                  groups=32,
                  use_condconv=True,
                  num_experts=4,
@@ -272,7 +338,7 @@ class DualPathBlock(nn.Module):
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
-        self.ln = ChannelLayerNorm(inc)
+        self.ln = AdaCLN(inc, time_emb_dim)
         self.conv1 = make_conv(inc, res_channels, 1)
 
         self.conv2 = make_conv(res_channels, res_channels, 7, p=3, g=groups)
@@ -294,7 +360,7 @@ class DualPathBlock(nn.Module):
         self.gelu = nn.GELU()
 
         # GRN
-        self.grn = GlobalResponseNorm(mid_channels)
+        self.grn = AttentiveAdaGRN(mid_channels, time_emb_dim)
 
         """
         在 Dual Path Block 中，
@@ -335,25 +401,25 @@ class DualPathBlock(nn.Module):
         self.conv3_dense = make_conv(mid_channels, dense_inc, 1)
 
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, time_emb) -> torch.Tensor:
         """
         Args:
             x(torch.Tensor): Input Tensor
         Return:
             Tensor
         """
-        def main_path(x_in):
-            out = self.conv1(self.ln(x_in))
-            out = self.conv2(out)
-            out = self.conv3_up(out)
+        def main_path(x_in, time_emb):
+            out = self.conv1(self.ln(x_in, time_emb), time_emb)
+            out = self.conv2(out, time_emb)
+            out = self.conv3_up(out, time_emb)
             out = self.gelu(out)
-            out = self.grn(out)
+            out = self.grn(out, time_emb)
             # 共享模式
             # out = self.conv3_down(out)
             # return out
             # 分离模式
-            out_res = self.conv3_res(out)
-            out_dense = self.conv3_dense(out)
+            out_res = self.conv3_res(out, time_emb)
+            out_dense = self.conv3_dense(out, time_emb)
             return out_res, out_dense
 
 
@@ -361,12 +427,12 @@ class DualPathBlock(nn.Module):
             # 共享模式
             # out = checkpoint(main_path, x, use_reentrant=False)
             # 分离模式
-            new_res, new_dense = checkpoint(main_path, x, use_reentrant=False)
+            new_res, new_dense = checkpoint(main_path, x, time_emb, use_reentrant=False)
         else:
             # 共享模式
             # out = main_path(x)
             # 分离模式
-            new_res, new_dense = main_path(x)
+            new_res, new_dense = main_path(x, time_emb)
 
         # 共享模式
         # new_res = out[:, :self.res_channels, :, :]
@@ -486,7 +552,7 @@ class DownsampleLayer(nn.Module):
             else:
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
-        self.ln = ChannelLayerNorm(in_channels)
+        self.ln = AdaCLN(in_channels)
         self.conv = make_conv(in_channels, out_channels + dense_inc, 2, s=2, p=0, g=groups)
 
     def forward(self, x) -> torch.Tensor:
@@ -541,7 +607,7 @@ class Stem(nn.Module):
                 return nn.Conv2d(in_c, out_c, k, stride=s, padding=p, groups=g, bias=False)
 
         self.conv = make_conv(in_channels, out_channels, kernel_size, s=stride, p=padding)
-        self.ln = ChannelLayerNorm(out_channels)
+        self.ln = AdaCLN(out_channels)
 
     def forward(self, x) -> torch.Tensor:
         """
