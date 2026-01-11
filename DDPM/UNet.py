@@ -6,6 +6,23 @@ import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
 
+class SinusoidalPositionalEmbeddings(nn.Module):
+    """
+    标准的正弦位置编码，用于将时间 t 映射为向量
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
 class TimeModulator(nn.Module):
     """
     用于 AdaCLN 和 AdaGRN 的时间映射模块
@@ -47,55 +64,60 @@ class TimeModulator(nn.Module):
 
 
 class TimeAttentionRouter(nn.Module):
-    def __init__(self, in_channels, time_emb_dim, num_experts=4):
+    def __init__(self, in_channels, time_emb_dim, num_experts=4, hidden_dim=64):
         super().__init__()
 
-        # 1. Q 映射 (Time)
-        self.to_q = nn.Linear(time_emb_dim, in_channels)
-        # 2. K 映射 (Content)
-        self.to_k = nn.Linear(in_channels, in_channels)
-        # 3. V 映射 (Content)
-        self.to_v = nn.Linear(in_channels, in_channels)
+        self.hidden_dim = hidden_dim
 
-        # 4. 通道混合矩阵 (如果想做通道间交互)
-        # 这是一个激进的设计：让通道之间可以相互说话
-        # 但参数量是 C*C，如果 C 很大要注意。这里用 reduction 降低风险
+        # 1. Q 映射 (Time) -> 压缩到 hidden_dim
+        self.to_q = nn.Linear(time_emb_dim, self.hidden_dim)
+
+        # 2. K 映射 (Content) -> 压缩到 hidden_dim
+        self.to_k = nn.Linear(in_channels, self.hidden_dim)
+
+        # 3. V 映射 (Content) -> 压缩到 hidden_dim
+        self.to_v = nn.Linear(in_channels, self.hidden_dim)
+
+        # 4. 通道混合矩阵 (Latent Mixer)
+        # 在 64 维的隐空间里做交互，参数量(64*64*2)
         self.channel_mixer = nn.Sequential(
-            nn.Linear(in_channels, in_channels // 4),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Linear(in_channels // 4, in_channels)
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
 
         # 5. 最终分类器
-        self.classifier = nn.Linear(in_channels, num_experts)
+        self.classifier = nn.Linear(self.hidden_dim, num_experts)
 
     def forward(self, x_pooled, time_emb):
         """
-        x_pooled: (B, C)
+        x_pooled: (B, C) - 全局平均池化后的特征
         time_emb: (B, T_dim)
         """
-        # 生成 Query (根据时间，我想要什么样的特征？)
-        q = self.to_q(time_emb)  # (B, C)
+        # 生成 Query (时间条件的隐特征)
+        q = self.to_q(time_emb)  # (B, hidden_dim)
 
-        # 生成 Key (图像实际有什么特征？)
-        k = self.to_k(x_pooled)  # (B, C)
+        # 生成 Key (图像内容的隐特征)
+        k = self.to_k(x_pooled)  # (B, hidden_dim)
 
-        # 计算注意力分数 (Element-wise dot product -> Sigmoid)
-        # 这里实际上是计算：时间对每个通道的“关注度”
-        attn_weights = torch.sigmoid(q * k)  # (B, C)
+        # 计算注意力/门控分数
+        # 你的注释里之前写 (B, C) 是错的，现在应该是 (B, hidden_dim)
+        # 这步操作的物理含义：时间 q 决定了它想“激活” latent space 中的哪些特征维度
+        attn_weights = torch.sigmoid(q * k)  # (B, hidden_dim)
 
-        # 应用注意力 (加权)
-        v = self.to_v(x_pooled)
-        x_attended = v * attn_weights  # (B, C)
-        # 此时 x_attended 已经被时间筛选过了：
-        # 如果是噪声阶段，attn_weights 可能抑制了高频纹理通道
+        # 生成 Value
+        v = self.to_v(x_pooled)  # (B, hidden_dim)
 
-        # 通道混合 (Channel Mixing)
-        # 允许通道之间交换信息 (比如：看到了眼睛，也要激活鼻子的特征)
+        # 应用注意力
+        # 筛选出当前时间步下，图像内容中最重要的隐特征
+        x_attended = v * attn_weights  # (B, hidden_dim)
+
+        # 混合 (Mixing)
+        # 让隐特征之间进行推理，得出最终结论
         x_mixed = x_attended + self.channel_mixer(x_attended)
 
         # 最终路由
-        logits = self.classifier(x_mixed)
+        logits = self.classifier(x_mixed)  # (B, num_experts)
         return logits
 
 
@@ -185,9 +207,9 @@ class TimeAwareCondConv2d(nn.Module):
             gating_logits = self.router(pooled, time_emb)
             # Add noise during training to encourage expert diversity
             noise = torch.randn_like(gating_logits) * self.gating_noise_std
-            routing_weights = torch.tanh(gating_logits + noise)
+            routing_weights = torch.sigmoid(gating_logits + noise)
         else:
-            routing_weights = torch.tanh(self.router(pooled, time_emb))
+            routing_weights = torch.sigmoid(self.router(pooled, time_emb))
 
         # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
         # weight_eff: [B, out, in//g, k, k]
@@ -352,10 +374,10 @@ class DualPathBlock(nn.Module):
             else:
                 raise TypeError("This feature is not yet implemented.")
 
-        self.ln = AdaCLN(inc, time_emb_dim)
         self.conv1 = make_conv(inc, res_channels, 1)
 
         self.conv2 = make_conv(res_channels, res_channels, 7, p=3, g=groups)
+        self.ln = AdaCLN(res_channels, time_emb_dim)
 
         mid_channels = res_channels * expansion_ratio
         self.conv3_up = make_conv(res_channels, mid_channels, 1)
@@ -368,7 +390,7 @@ class DualPathBlock(nn.Module):
 
         # 对于 Dense 部分，如果也想让它初始“隐身”，也可以加一个
         # 作用：保证初期 concatenation 的部分接近 0，不破坏下一层的输入分布
-        self.gamma_dense = nn.Parameter(1e-6 * torch.ones(dense_inc), requires_grad=True)
+        self.gamma_dense = nn.Parameter(1e-3 * torch.ones(dense_inc), requires_grad=True)
 
 
         self.gelu = nn.GELU()
@@ -424,8 +446,9 @@ class DualPathBlock(nn.Module):
             Tensor
         """
         def main_path(x_in, time_emb):
-            out = self.conv1(self.ln(x_in, time_emb), time_emb)
+            out = self.conv1(x_in, time_emb)
             out = self.conv2(out, time_emb)
+            out = self.ln(out, time_emb)
             out = self.conv3_up(out, time_emb)
             out = self.gelu(out)
             out = self.grn(out, time_emb)
@@ -603,6 +626,137 @@ class DownsampleLayer(nn.Module):
             return checkpoint(main_path, x, time_emb, use_reentrant=False)
         else:
             return main_path(x, time_emb)
+
+
+class UpsampleLayer(nn.Module):
+    """
+    上采样层：Nearest Interpolation + (TimeAwareCondConv or TimeAwareConv)
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 time_emb_dim,
+                 groups=1,
+                 use_condconv=True,
+                 num_experts=4):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        self.conv = make_conv(in_channels, out_channels, 3,1,1,groups)
+        self.ln = AdaCLN(in_channels, time_emb_dim)
+
+    def forward(self, x, time_emb):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            x_in = self.ln(x_in, time_emb_in)
+            x_in = self.upsample(x_in)
+            x_in = self.conv(x_in, time_emb_in)
+            return x_in
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
+
+
+class TimeAwareSelfAttention(nn.Module):
+    """
+    带 AdaCLN 调制的多头自注意力机制 (MHSA)。
+    对于 256x256 的图像，建议只在低分辨率层 (32x32, 16x16, 8x8) 使用，
+    否则显存会爆炸。
+    使用 PyTorch 2.0+ 的 F.scaled_dot_product_attention 进行加速。
+    """
+
+    def __init__(self, channels, time_emb_dim, num_heads=4, head_dim=64):
+        super().__init__()
+        self.num_heads = num_heads
+        # 如果不手动指定 scale，SDPA 默认就是 1/sqrt(dim)，但在显式传参时我们通常保留这个属性
+        self.scale = head_dim ** -0.5
+        inner_dim = num_heads * head_dim
+
+        # AdaCLN，这是 TimeAware 的核心
+        self.ln = AdaCLN(channels, time_emb_dim)
+
+        # QKV 生成 (Bias通常设为False以获得纯粹的投影，看个人喜好)
+        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=False)
+
+        # 输出投影
+        self.to_out = nn.Linear(inner_dim, channels)
+
+    def forward(self, x, time_emb):
+        """
+        x: (B, C, H, W)
+        time_emb: (B, t_dim)
+        """
+        B, C, H, W = x.shape
+        N = H * W
+
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            # 1. AdaCLN Norm & Reshape (Image -> Sequence)
+            # (B, C, H, W) -> (B, N, C)
+            norm_x = self.ln(x_in, time_emb_in)
+            norm_x = norm_x.permute(0, 2, 3, 1).view(B, N, C)
+
+            # 2. 生成 Q, K, V
+            # shape: (B, N, 3 * inner_dim)
+            qkv = self.to_qkv(norm_x)
+
+            # 拆分 Q, K, V
+            # 此时形状: (B, N, num_heads * head_dim)
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            # 变换形状以适配 scaled_dot_product_attention
+            # 需要变换为 (B, Num_Heads, Seq_Len, Head_Dim)
+            q = q.view(B, N, self.num_heads, -1).transpose(1, 2)
+            k = k.view(B, N, self.num_heads, -1).transpose(1, 2)
+            v = v.view(B, N, self.num_heads, -1).transpose(1, 2)
+
+            # 3. Flash Attention (核心加速步骤)
+            # PyTorch 会自动处理 Mask (这里没有 mask) 和 Scale
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scale
+            )
+
+            # 4. 还原形状
+            # (B, Num_Heads, N, Head_Dim) -> (B, N, Num_Heads, Head_Dim) -> (B, N, Inner_Dim)
+            # 注意：这里必须用 contiguous()，因为 transpose 改变了内存布局
+            out = out.transpose(1, 2).contiguous().view(B, N, -1)
+
+            # 5. 输出投影
+            out = self.to_out(out)
+
+            # 6. 变回图像空间 (Sequence -> Image)
+            # (B, N, C) -> (B, C, H, W)
+            out = out.view(B, H, W, C).permute(0, 3, 1, 2)
+
+            # Residual connection
+            return x_in + out
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
+
 
 class Stem(nn.Module):
     """
