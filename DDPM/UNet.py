@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
-
+# SinusoidalPositionalEmbeddings暂时不启用，因为有GaussianFourierProjection了
 class SinusoidalPositionalEmbeddings(nn.Module):
     """
     标准的正弦位置编码，用于将时间 t 映射为向量
@@ -22,6 +22,93 @@ class SinusoidalPositionalEmbeddings(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
+
+class GaussianFourierProjection(nn.Module):
+    """
+    Gaussian Fourier Embeddings (借鉴自 Score-based Generative Modeling)
+    比标准的 Sinusoidal 更能捕捉高频变化，适合精细控制。
+    """
+    def __init__(self, embed_dim, scale=16.0):
+        super().__init__()
+        # 随机初始化频率矩阵，并在训练中保持固定（或者设为 Parameter 可学习）
+        # 这里为了更强的适应性，设为不可学习的 buffer，类似于标准的 position embedding
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+
+    def forward(self, x):
+        # x: (B,) -> time steps
+        x_proj = x[:, None] * self.W[None, :] * 2 * torch.pi
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+
+class ResMLPBlock(nn.Module):
+    """
+    带残差连接的 MLP Block，允许网络做得更深而不梯度消失
+    """
+    def __init__(self,
+                 dim,
+                 dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.Dropout(dropout)
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class TimeMLP(nn.Module):
+    """
+    将时间 t 映射为高质量的控制向量。
+    """
+
+    def __init__(self,
+                 time_emb_dim=256,  # 最终输出维度 (也就是 U-Net 里的 time_emb_dim)
+                 hidden_dim=512,  # 内部隐层维度 (建议比 time_emb_dim 大)
+                 num_layers=4,  # 深度：4 层足够产生非线性极强的控制信号
+                 fourier_scale=16.0):  # 频率缩放系数
+        super().__init__()
+
+        # 1. 高斯傅里叶投影 (Time -> Hidden)
+        self.fourier = GaussianFourierProjection(hidden_dim, scale=fourier_scale)
+
+        # 2. 初始映射
+        self.input_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU()
+        )
+
+        # 3. 深层残差网络 (Deep Mapping)
+        # 用来解耦时间步，让 t=500 和 t=501 产生足够不同且平滑变化的特征
+        self.mapping = nn.ModuleList([
+            ResMLPBlock(hidden_dim) for _ in range(num_layers)
+        ])
+
+        # 4. 输出层 (Hidden -> Time Emb Dim)
+        self.out_proj = nn.Linear(hidden_dim, time_emb_dim)
+
+    def forward(self, time):
+        """
+        time: (B,) 输入的时间步索引或归一化时间
+        """
+        if time.dtype == torch.long:
+            time = time.float()
+
+        # 1. 投影
+        x = self.fourier(time)
+
+        # 2. 初始激活
+        x = self.input_proj(x)
+
+        # 3. 深层处理
+        for block in self.mapping:
+            x = block(x)
+
+        # 4. 调整维度输出
+        return self.out_proj(x)
 
 class TimeModulator(nn.Module):
     """
@@ -101,7 +188,6 @@ class TimeAttentionRouter(nn.Module):
         k = self.to_k(x_pooled)  # (B, hidden_dim)
 
         # 计算注意力/门控分数
-        # 你的注释里之前写 (B, C) 是错的，现在应该是 (B, hidden_dim)
         # 这步操作的物理含义：时间 q 决定了它想“激活” latent space 中的哪些特征维度
         attn_weights = torch.sigmoid(q * k)  # (B, hidden_dim)
 
@@ -319,7 +405,7 @@ class DualPathBlock(nn.Module):
     inspired by ConvNeXt V1/V2:
         Larger 7x7 kernel for spatial mixing.
         Inverted bottleneck MLP in pointwise part (1x1 up -> GELU -> GRN -> 1x1 down).
-        Minimal Channel-wise LayerNorm (only one at the block start, following ConvNeXt philosophy).
+        Minimal Channel-wise LayerNorm.
         GELU activation.
         GRN from ConvNeXt V2 to prevent feature collapse.
 
@@ -388,9 +474,9 @@ class DualPathBlock(nn.Module):
         # 这样初始时，new_res * gamma_res ≈ 0，相当于恒等映射
         self.gamma_res = nn.Parameter(1e-6 * torch.ones(res_channels), requires_grad=True)
 
-        # 对于 Dense 部分，如果也想让它初始“隐身”，也可以加一个
-        # 作用：保证初期 concatenation 的部分接近 0，不破坏下一层的输入分布
-        self.gamma_dense = nn.Parameter(1e-3 * torch.ones(dense_inc), requires_grad=True)
+        # 对于 Dense 部分，小一些是为了稳定训练，但一定不能接近0
+        # 需要比gamma_res大，以防止Dense路径失活
+        self.gamma_dense = nn.Parameter(1e-2 * torch.ones(dense_inc), requires_grad=True)
 
 
         self.gelu = nn.GELU()
@@ -817,12 +903,67 @@ class Stem(nn.Module):
         Return:
             Tensor
         """
-        def stem_path(x_in, time_emb_in):
+        def main_path(x_in, time_emb_in):
             out = self.conv(x_in, time_emb_in)
             out = self.ln(out, time_emb_in)
             return out
 
         if self.training:
-            return checkpoint(stem_path, x, time_emb, use_reentrant=False)
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
         else:
-            return stem_path(x, time_emb)
+            return main_path(x, time_emb)
+
+
+class TimeAwareToRGB(nn.Module):
+    """
+    将特征映射回图像空间 (RGB或噪声)。
+    通常结构: Norm -> SiLU -> Conv
+    bias=True:
+        没有 Bias，模型必须强行通过调整 Conv 的权重来拟合这个均值偏移。
+        bias=True 允许每个 Expert 不仅学习特征的模式（Pattern/Texture），还能学习特征的基准偏移（Offset/Brightness）。
+        即使gamma 很小，模型仍然保留了通过 Bias 调整局部均值的潜力（虽然一开始也被压制了，
+        但随着 gamma 变大，Bias 能立即发挥作用，而不需要重新通过调整巨大的 Kernel 权重来模拟偏移）。
+    """
+
+    def __init__(self,
+                 in_channels:int,
+                 time_emb_dim:int,
+                 out_channels:int=3,
+                 use_condconv:bool=True,
+                 num_experts: int = 4):
+        super().__init__()
+
+        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=True,
+                    num_experts=num_experts
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        # 使用 AdaCLN 做最后的归一化，确保去噪结束时的分布也受时间控制
+        self.norm = AdaCLN(in_channels, time_emb_dim)
+        self.act = nn.GELU()
+        # 使用 1x1 卷积将通道数压缩到 3
+        self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
+        self.gamma = nn.Parameter(1e-6 * torch.ones(out_channels), requires_grad=True)
+
+    def forward(self, x, time_emb):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            x_in = self.norm(x_in, time_emb_in)
+            x_in = self.act(x_in)
+            x_in = self.conv(x_in, time_emb_in)
+            return x_in * self.gamma.view(1, -1, 1, 1)
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
