@@ -222,7 +222,7 @@ class TimeAwareCondConv2d(nn.Module):
                  stride: int = 1,
                  padding: int = 0,
                  groups: int = 1,
-                 bias: bool = False,
+                 bias: bool = True,
                  num_experts: int = 4,
                  gating_noise_std: float = 1e-2, ):
         super(TimeAwareCondConv2d, self).__init__()
@@ -429,7 +429,7 @@ class DualPathBlock(nn.Module):
                  res_channels: int,
                  dense_inc: int,
                  time_emb_dim: int,
-                 groups: int=32,
+                 groups: int=8,
                  use_condconv: bool=True,
                  num_experts: int=4,
                  expansion_ratio: int=4,):
@@ -454,7 +454,7 @@ class DualPathBlock(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=False,
+                    bias=True,
                     num_experts=num_experts
                 )
             else:
@@ -645,6 +645,54 @@ class DualPathStage(nn.Module):
         return x
 
 
+class FeatureFusionBlock(nn.Module):
+    """
+    专门用于 Decoder 阶段 skip connection 拼接后的特征融合与降维。
+    结构: AdaCLN -> GELU -> 1x1 TimeAwareCondConv
+
+    对于是否使用激活，还需思考
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 time_emb_dim,
+                 use_condconv=True,
+                 num_experts=4):
+        super().__init__()
+        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=True,
+                    num_experts=num_experts
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        self.act = nn.GELU()
+        self.norm = AdaCLN(in_channels, time_emb_dim)
+        # 1x1 卷积用于降维，不改变空间尺寸
+        self.conv = make_conv(in_channels, out_channels, 1,1,0,1)
+
+    def forward(self, x, time_emb):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            x_in = self.norm(x_in, time_emb_in)
+            x_in = self.act(x_in)
+            return self.conv(x_in, time_emb_in)
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
+
+
 class DownsampleLayer(nn.Module):
     """
     DownsampleLayer for DPN: Downsamples feature maps and adjusts channel dimensions.
@@ -659,6 +707,7 @@ class DownsampleLayer(nn.Module):
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
 
+    建议开启 Bias，因为尺寸改变时基准值可能会变
 
     """
     def __init__(self,
@@ -688,7 +737,7 @@ class DownsampleLayer(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=False,
+                    bias=True,
                     num_experts=num_experts
                 )
             else:
@@ -706,7 +755,8 @@ class DownsampleLayer(nn.Module):
             Tensor
         """
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            return self.conv(self.ln(x_in, time_emb_in), time_emb_in)
+            x_in = self.ln(x_in, time_emb_in)
+            return self.conv(x_in, time_emb_in)
 
         if self.training:
             return checkpoint(main_path, x, time_emb, use_reentrant=False)
@@ -717,18 +767,19 @@ class DownsampleLayer(nn.Module):
 class UpsampleLayer(nn.Module):
     """
     上采样层：Nearest Interpolation + (TimeAwareCondConv or TimeAwareConv)
+    Bias 允许模型学习一个独立于输入的“基础底色”或“亮度偏移”。
+    这里的是否使用激活，还需要思考
     """
 
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 time_emb_dim,
-                 groups=1,
-                 use_condconv=True,
-                 num_experts=4):
+                 in_channels: int,
+                 out_channels: int,
+                 dense_inc: int,
+                 time_emb_dim: int,
+                 groups: int=1,
+                 use_condconv: bool=True,
+                 num_experts: int=4):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-
         def make_conv(in_c, out_c, k, s=1, p=0, g=1):
             if use_condconv:
                 return TimeAwareCondConv2d(
@@ -739,18 +790,21 @@ class UpsampleLayer(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=False,
+                    bias=True,
                     num_experts=num_experts
                 )
             else:
                 raise TypeError("This feature is not yet implemented.")
 
-        self.conv = make_conv(in_channels, out_channels, 3,1,1,groups)
         self.ln = AdaCLN(in_channels, time_emb_dim)
+        self.act = nn.GELU()
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv = make_conv(in_channels, out_channels + dense_inc, 3,1,1,groups)
 
     def forward(self, x, time_emb):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
             x_in = self.ln(x_in, time_emb_in)
+            x_in = self.act(x_in)
             x_in = self.upsample(x_in)
             x_in = self.conv(x_in, time_emb_in)
             return x_in
@@ -769,7 +823,11 @@ class TimeAwareSelfAttention(nn.Module):
     使用 PyTorch 2.0+ 的 F.scaled_dot_product_attention 进行加速。
     """
 
-    def __init__(self, channels, time_emb_dim, num_heads=4, head_dim=64):
+    def __init__(self,
+                 channels,
+                 time_emb_dim,
+                 num_heads=6,
+                 head_dim=64):
         super().__init__()
         self.num_heads = num_heads
         # 如果不手动指定 scale，SDPA 默认就是 1/sqrt(dim)，但在显式传参时我们通常保留这个属性
@@ -780,7 +838,7 @@ class TimeAwareSelfAttention(nn.Module):
         self.ln = AdaCLN(channels, time_emb_dim)
 
         # QKV 生成 (Bias通常设为False以获得纯粹的投影，看个人喜好)
-        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=False)
+        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=True)
 
         # 输出投影
         self.to_out = nn.Linear(inner_dim, channels)
@@ -855,8 +913,11 @@ class Stem(nn.Module):
         kernel_size: default 4 for classification
         stride: default 4 for classification
         padding: default 0 for classification
+        groups: default 1 for classification
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
+
+    LayerNorm 只能移除这些 Bias 的平均值，但通道之间 Bias 的相对差异会被保留下来，并影响归一化后的分布形状。
     """
 
     def __init__(self,
@@ -883,7 +944,7 @@ class Stem(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=False,
+                    bias=True,
                     num_experts=num_experts
                 )
             else:
@@ -966,143 +1027,117 @@ class TimeAwareToRGB(nn.Module):
 
 
 class CatDiffusionUNet(nn.Module):
-    def __init__(self,
-                 in_channels=3,
-                 base_channels=64,
-                 time_emb_dim=256,
-                 groups=8):  # 建议 groups 设为 16 或 32，适配较小的通道数
+    def __init__(self, in_channels=3, time_emb_dim=256):
         super().__init__()
-
         self.time_emb_dim = time_emb_dim
-
-        # 1. 时间编码网络
         self.time_mlp = TimeMLP(time_emb_dim=time_emb_dim, hidden_dim=512)
 
-        # 2. Stem (头部)
-        # 注意：这里 stride=1，padding=1，保持 64x64 分辨率
-        self.stem = Stem(in_channels, base_channels, time_emb_dim,
-                         kernel_size=3, stride=1, padding=1, groups=1)
+        # Stem
+        self.stem = self.stem = Stem(in_channels, 64, time_emb_dim,
+                 kernel_size=3, stride=1, padding=1, groups=1)
 
         # ================= ENCODER =================
-        # Level 1: 64x64
-        # In: 64 -> Out: 64 + 2*16 = 96 (Dense增长)
-        self.enc1 = DualPathStage(in_channels=base_channels, res_channels=base_channels,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
+        # Enc1: 64ch
+        self.enc1 = DualPathStage(64, 64, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        # Down1: 96 -> 128
+        self.down1 = DownsampleLayer(96, 128, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Down 1: 64x64 -> 32x32. Channel: 96 -> 128
-        self.down1 = DownsampleLayer(in_channels=96, out_channels=128, dense_inc=0,
-                                     time_emb_dim=time_emb_dim, groups=groups)
+        # Enc2: 128ch
+        self.enc2 = DualPathStage(128, 128, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        # Down2: 160 -> 256
+        self.down2 = DownsampleLayer(160, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Level 2: 32x32
-        # In: 128 -> Out: 128 + 2*16 = 160
-        self.enc2 = DualPathStage(in_channels=128, res_channels=128,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
-
-        # Down 2: 32x32 -> 16x16. Channel: 160 -> 256
-        self.down2 = DownsampleLayer(in_channels=160, out_channels=256, dense_inc=0,
-                                     time_emb_dim=time_emb_dim, groups=groups)
-
-        # Level 3: 16x16 (开始加 Attention)
-        # In: 256 -> Out: 256 + 2*16 = 288
-        self.enc3 = DualPathStage(in_channels=256, res_channels=256,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
-        self.att3 = TimeAwareSelfAttention(288, time_emb_dim)
-
-        # Down 3: 16x16 -> 8x8. Channel: 288 -> 384
-        self.down3 = DownsampleLayer(in_channels=288, out_channels=384, dense_inc=0,
-                                     time_emb_dim=time_emb_dim, groups=groups)
+        # Enc3: 256ch
+        self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.att3 = TimeAwareSelfAttention(288, time_emb_dim)  # 256 + 2*16 = 288
+        # Down3: 288 -> 384
+        self.down3 = DownsampleLayer(288, 384, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
-        # Level 4: 8x8
-        # In: 384 -> Out: 384 + 2*16 = 416
-        self.bot_stage = DualPathStage(in_channels=384, res_channels=384,
-                                       num_blocks=2, dense_inc=16, groups=groups,
+        # Bot: 384ch
+        self.bot_stage = DualPathStage(384, 384, num_blocks=4, dense_inc=16, groups=8,
                                        time_emb_dim=time_emb_dim)
-        self.bot_att = TimeAwareSelfAttention(416, time_emb_dim)
+        self.bot_att = TimeAwareSelfAttention(448, time_emb_dim)  # 384 + 4*16 = 448
 
         # ================= DECODER =================
-        # Up 1: 8x8 -> 16x16. Channel: 416 -> 256
-        self.up1 = UpsampleLayer(in_channels=416, out_channels=256,
-                                 time_emb_dim=time_emb_dim, groups=groups)
 
-        # Cat: Up(256) + Skip_Enc3(288) = 544
-        # Stage: Reduce 544 -> Res 256. Out: 256 + 2*16 = 288
-        self.dec1 = DualPathStage(in_channels=544, res_channels=256,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
-        self.dec1_att = TimeAwareSelfAttention(288, time_emb_dim)
+        # --- Up 1 (8x8 -> 16x16) ---
+        # Bot Out (448) -> Up (256)
+        self.up1 = UpsampleLayer(448, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Up 2: 16x16 -> 32x32. Channel: 288 -> 128
-        self.up2 = UpsampleLayer(in_channels=288, out_channels=128,
-                                 time_emb_dim=time_emb_dim, groups=groups)
+        # Concat: Up1(256) + Enc3_Skip(288) = 544
+        # Fusion: 544 -> 384
+        self.fuse1 = FeatureFusionBlock(544, 384, time_emb_dim)
 
-        # Cat: Up(128) + Skip_Enc2(160) = 288
-        # Stage: Reduce 288 -> Res 128. Out: 128 + 2*16 = 160
-        self.dec2 = DualPathStage(in_channels=288, res_channels=128,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
+        # Stage: 处理 384 通道
+        self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim)  # 384 + 2*16 = 416
 
-        # Up 3: 32x32 -> 64x64. Channel: 160 -> 64
-        self.up3 = UpsampleLayer(in_channels=160, out_channels=64,
-                                 time_emb_dim=time_emb_dim, groups=groups)
+        # --- Up 2 (16x16 -> 32x32) ---
+        # Dec1 Out (416) -> Up (256) (之前是128，这里保持一定宽度)
+        self.up2 = UpsampleLayer(416, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Cat: Up(64) + Skip_Enc1(96) = 160
-        # Stage: Reduce 160 -> Res 64. Out: 64 + 2*16 = 96
-        self.dec3 = DualPathStage(in_channels=160, res_channels=64,
-                                  num_blocks=2, dense_inc=16, groups=groups,
-                                  time_emb_dim=time_emb_dim)
+        # Concat: Up2(192) + Enc2_Skip(160) = 352
+        # Fusion: 352 -> 192
+        self.fuse2 = FeatureFusionBlock(352, 192, time_emb_dim)
+
+        self.dec2 = DualPathStage(192, 192, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        # Dec2 Out: 192 + 32 = 224
+
+        # --- Up 3 (32x32 -> 64x64) ---
+        # Dec2 Out (224) -> Up (128)
+        self.up3 = UpsampleLayer(224, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+
+        # Concat: Up3(96) + Enc1_Skip(96) = 192
+        # Fusion: 192 -> 96
+        self.fuse3 = FeatureFusionBlock(192, 96, time_emb_dim)
+
+        self.dec3 = DualPathStage(96, 96, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        # Dec3 Out: 96 + 32 = 128
 
         # ================= OUTPUT =================
-        self.final = TimeAwareToRGB(in_channels=96, time_emb_dim=time_emb_dim, out_channels=3)
+        self.final = TimeAwareToRGB(128, time_emb_dim, 3)
 
     def forward(self, x, time):
-        # 1. 计算时间嵌入
         t_emb = self.time_mlp(time)
+        x = self.stem(x, t_emb)
 
-        # 2. Stem
-        x = self.stem(x, t_emb)  # (B, 64, 64, 64)
+        # Encoder
+        h1 = self.enc1(x, t_emb)
+        x = self.down1(h1, t_emb)
 
-        # 3. Encoder Path
-        # --- Level 1 ---
-        h1 = self.enc1(x, t_emb)  # (B, 96, 64, 64) -> Keep for skip
-        x = self.down1(h1, t_emb)  # (B, 128, 32, 32)
+        h2 = self.enc2(x, t_emb)
+        x = self.down2(h2, t_emb)
 
-        # --- Level 2 ---
-        h2 = self.enc2(x, t_emb)  # (B, 160, 32, 32) -> Keep for skip
-        x = self.down2(h2, t_emb)  # (B, 256, 16, 16)
-
-        # --- Level 3 ---
         h3 = self.enc3(x, t_emb)
-        h3 = self.att3(h3, t_emb)  # (B, 288, 16, 16) -> Keep for skip
-        x = self.down3(h3, t_emb)  # (B, 384, 8, 8)
+        h3 = self.att3(h3, t_emb)
+        x = self.down3(h3, t_emb)
 
-        # 4. Bottleneck
+        # Bottleneck
         x = self.bot_stage(x, t_emb)
-        x = self.bot_att(x, t_emb)  # (B, 416, 8, 8)
+        x = self.bot_att(x, t_emb)
 
-        # 5. Decoder Path
-        # --- Up 1 ---
-        x = self.up1(x, t_emb)  # (B, 256, 16, 16)
-        x = torch.cat([x, h3], dim=1)  # Cat 256 + 288 = 544
+        # Decoder
+        # Layer 1
+        x = self.up1(x, t_emb)
+        x = torch.cat([x, h3], dim=1)
+        x = self.fuse1(x, t_emb)
         x = self.dec1(x, t_emb)
-        x = self.dec1_att(x, t_emb)  # (B, 288, 16, 16)
+        x = self.dec1_att(x, t_emb)
 
-        # --- Up 2 ---
-        x = self.up2(x, t_emb)  # (B, 128, 32, 32)
-        x = torch.cat([x, h2], dim=1)  # Cat 128 + 160 = 288
-        x = self.dec2(x, t_emb)  # (B, 160, 32, 32)
+        # Layer 2
+        x = self.up2(x, t_emb)
+        x = torch.cat([x, h2], dim=1)
+        x = self.fuse2(x, t_emb)
+        x = self.dec2(x, t_emb)
 
-        # --- Up 3 ---
-        x = self.up3(x, t_emb)  # (B, 64, 64, 64)
-        x = torch.cat([x, h1], dim=1)  # Cat 64 + 96 = 160
-        x = self.dec3(x, t_emb)  # (B, 96, 64, 64)
+        # Layer 3
+        x = self.up3(x, t_emb)
+        x = torch.cat([x, h1], dim=1)
+        x = self.fuse3(x, t_emb)
+        x = self.dec3(x, t_emb)
 
-        # 6. Final
-        out = self.final(x, t_emb)  # (B, 3, 64, 64)
-        return out
+        return self.final(x, t_emb)
 
 
 # ================= 测试代码 =================
@@ -1111,7 +1146,7 @@ if __name__ == "__main__":
     print(f"Testing on {device}")
 
     # 1. 实例化模型
-    model = CatDiffusionUNet(in_channels=3, base_channels=64, time_emb_dim=256, groups=16).to(device)
+    model = CatDiffusionUNet(in_channels=3, time_emb_dim=256).to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
