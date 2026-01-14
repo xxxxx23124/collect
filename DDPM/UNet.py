@@ -30,9 +30,11 @@ class GaussianFourierProjection(nn.Module):
     """
     def __init__(self, embed_dim, scale=16.0):
         super().__init__()
-        # 随机初始化频率矩阵，并在训练中保持固定（或者设为 Parameter 可学习）
-        # 这里为了更强的适应性，设为不可学习的 buffer，类似于标准的 position embedding
-        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+        # 创建 tensor
+        W = torch.randn(embed_dim // 2) * scale
+
+        # 注册为 buffer
+        self.register_buffer("W", W)
 
     def forward(self, x):
         # x: (B,) -> time steps
@@ -826,7 +828,7 @@ class TimeAwareSelfAttention(nn.Module):
     def __init__(self,
                  channels,
                  time_emb_dim,
-                 num_heads=6,
+                 num_heads=4,
                  head_dim=64):
         super().__init__()
         self.num_heads = num_heads
@@ -838,7 +840,7 @@ class TimeAwareSelfAttention(nn.Module):
         self.ln = AdaCLN(channels, time_emb_dim)
 
         # QKV 生成 (Bias通常设为False以获得纯粹的投影，看个人喜好)
-        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=True)
+        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=False)
 
         # 输出投影
         self.to_out = nn.Linear(inner_dim, channels)
@@ -1049,7 +1051,7 @@ class CatDiffusionUNet(nn.Module):
 
         # Enc3: 256ch
         self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
-        self.att3 = TimeAwareSelfAttention(288, time_emb_dim)  # 256 + 2*16 = 288
+        self.att3 = TimeAwareSelfAttention(288, time_emb_dim, num_heads=4)  # 256 + 2*16 = 288
         # Down3: 288 -> 384
         self.down3 = DownsampleLayer(288, 384, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
@@ -1057,7 +1059,7 @@ class CatDiffusionUNet(nn.Module):
         # Bot: 384ch
         self.bot_stage = DualPathStage(384, 384, num_blocks=4, dense_inc=16, groups=8,
                                        time_emb_dim=time_emb_dim)
-        self.bot_att = TimeAwareSelfAttention(448, time_emb_dim)  # 384 + 4*16 = 448
+        self.bot_att = TimeAwareSelfAttention(448, time_emb_dim, num_heads=6)  # 384 + 4*16 = 448
 
         # ================= DECODER =================
 
@@ -1071,10 +1073,10 @@ class CatDiffusionUNet(nn.Module):
 
         # Stage: 处理 384 通道
         self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
-        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim)  # 384 + 2*16 = 416
+        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim, num_heads=6)  # 384 + 2*16 = 416
 
         # --- Up 2 (16x16 -> 32x32) ---
-        # Dec1 Out (416) -> Up (256) (之前是128，这里保持一定宽度)
+        # Dec1 Out (416) -> Up (256)
         self.up2 = UpsampleLayer(416, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up2(192) + Enc2_Skip(160) = 352
