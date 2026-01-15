@@ -84,14 +84,14 @@ def run_training(
         print(f"📉 Epoch {epoch + 1} Average Loss: {avg_loss:.4f}")
 
         # 每隔 10 个 epoch 保存一次，并尝试采样看效果
-        if (epoch + 1) % 10 == 0:
+        # if (epoch + 1) % 10 == 0:
             # torch.save(ddpm.model.state_dict(), save_path)
             # print(f"💾 Model saved to {save_path}")
 
-            # 采样并保存图片
-            print("🎨 Sampling images...")
-            generated_imgs = ddpm.sample(num_samples=8, img_size=64)  # 生成 8 张
-            save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
-            print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
+        # 采样并保存图片
+        print("🎨 Sampling images...")
+        generated_imgs = ddpm.sample(num_samples=8, img_size=64)  # 生成 8 张
+        save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
+        print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
 
     print("✅ Training Finished!")

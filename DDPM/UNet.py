@@ -226,7 +226,7 @@ class TimeAwareCondConv2d(nn.Module):
                  groups: int = 1,
                  bias: bool = True,
                  num_experts: int = 4,
-                 gating_noise_std: float = 1e-2, ):
+                 gating_noise_std: float = 1e-2,):
         super(TimeAwareCondConv2d, self).__init__()
         assert in_channels % groups == 0, "in_channels must be divisible by groups."
         assert out_channels % groups == 0, "out_channels must be divisible by groups."
