@@ -486,41 +486,6 @@ class DualPathBlock(nn.Module):
         # GRN
         self.grn = AttentiveAdaGRN(mid_channels, time_emb_dim)
 
-        """
-        在 Dual Path Block 中，
-        Dense Path（需要拼接传给下一层的特征）和 Residual Path（用于当前层加和的特征），
-        应该共享同一个 CondConv 生成的卷积核，还是应该分开处理？
-        1. 特征耦合性
-            共享模式:
-                强制耦合：
-                    同一个 CondConv 的专家（Experts）必须同时负责生成 Residual 特征和 Dense 特征。
-                    这意味着，路由网络（Router）选择某个专家时，该专家必须“全能”。
-                潜在冲突：
-                    Residual 特征倾向于“修正”（比如去除噪声、微调纹理），
-                    而 Dense 特征倾向于“保存”（保留高频信息、边缘、原始语义供后续使用）。
-                    让同一个卷积核同时做这两件事，可能会产生目标冲突。
-            分离模式:
-                解耦：
-                    Residual 分支可以专注于当前层的特征提纯，Dense 分支可以专注于挖掘新颖的特征供深层网络使用。
-                灵活性：
-                    对于某些样本，可能需要很强的 Residual 修正，但不需要太多的新特征；反之亦然。
-                    分离后，两个 Router 可以根据输入做出不同的选择。
-        2. 专家专业度
-            共享模式：
-                专家必须是“通才”。
-            分离模式：
-                Res 专家：可能专门学习如何做残差去噪、平滑。
-                Dense 专家：可能专门学习如何提取边缘、特定形状、特定语义。
-        3. 参数效率与计算成本
-            共享模式：
-                省参数，省路由计算开销。
-            分离模式：
-                需要两个 Router，做两次权重组合。
-        """
-        # 共享模式
-        # self.conv3_down = make_conv(mid_channels, res_channels + dense_inc, 1)
-
-        # 分离模式
         self.conv3_res = make_conv(mid_channels, res_channels, 1)
         self.conv3_dense = make_conv(mid_channels, dense_inc, 1)
 
@@ -533,43 +498,21 @@ class DualPathBlock(nn.Module):
         Return:
             Tensor
         """
-        def main_path(x_in, time_emb):
+        def main_path(x_in: torch.Tensor, time_emb: torch.Tensor):
             out = self.conv1(x_in, time_emb)
             out = self.conv2(out, time_emb)
             out = self.ln(out, time_emb)
             out = self.conv3_up(out, time_emb)
             out = self.gelu(out)
             out = self.grn(out, time_emb)
-            # 共享模式
-            # out = self.conv3_down(out)
-            # return out
-            # 分离模式
             out_res = self.conv3_res(out, time_emb)
             out_dense = self.conv3_dense(out, time_emb)
             return out_res, out_dense
 
-
-        if self.training:
-            # 共享模式
-            # out = checkpoint(main_path, x, use_reentrant=False)
-            # 分离模式
-            new_res, new_dense = checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            # 共享模式
-            # out = main_path(x)
-            # 分离模式
-            new_res, new_dense = main_path(x, time_emb)
-
-        # 共享模式
-        # new_res = out[:, :self.res_channels, :, :]
-        # new_dense = out[:, self.res_channels:, :, :]
-        # 分离模式 不需要此操作
+        new_res, new_dense = main_path(x, time_emb)
 
         prev_res = x[:, :self.res_channels, :, :]
         prev_dense = x[:, self.res_channels:, :, :]
-        # 应用 LayerScale
-        # 将 new_res 乘上可学习的 gamma_res
-        # gamma_res 维度是 [C]，通过广播变为 [1, C, 1, 1]
         residual = prev_res + new_res * self.gamma_res.view(1, -1, 1, 1)
         if prev_dense.size(1) > 0:
             dense = torch.cat((prev_dense, new_dense * self.gamma_dense.view(1, -1, 1, 1)), dim=1)
@@ -642,9 +585,17 @@ class DualPathStage(nn.Module):
         Return:
             Tensor
         """
-        for block in self.blocks:
-            x = block(x, time_emb)
-        return x
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+
+            for block in self.blocks:
+                x_in = block(x_in, time_emb_in)
+            return x_in
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
+
 
 
 class FeatureFusionBlock(nn.Module):
@@ -689,10 +640,7 @@ class FeatureFusionBlock(nn.Module):
             x_in = self.act(x_in)
             return self.conv(x_in, time_emb_in)
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class DownsampleLayer(nn.Module):
@@ -760,10 +708,7 @@ class DownsampleLayer(nn.Module):
             x_in = self.ln(x_in, time_emb_in)
             return self.conv(x_in, time_emb_in)
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class UpsampleLayer(nn.Module):
@@ -811,10 +756,7 @@ class UpsampleLayer(nn.Module):
             x_in = self.conv(x_in, time_emb_in)
             return x_in
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class TimeAwareSelfAttention(nn.Module):
@@ -898,10 +840,7 @@ class TimeAwareSelfAttention(nn.Module):
             # Residual connection
             return x_in + out
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class Stem(nn.Module):
@@ -968,10 +907,7 @@ class Stem(nn.Module):
             out = self.ln(out, time_emb_in)
             return out
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class TimeAwareToRGB(nn.Module):
@@ -1022,10 +958,7 @@ class TimeAwareToRGB(nn.Module):
             x_in = self.conv(x_in, time_emb_in)
             return x_in * self.gamma.view(1, -1, 1, 1)
 
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
+        return main_path(x, time_emb)
 
 
 class DiffusionUNet_64(nn.Module):
