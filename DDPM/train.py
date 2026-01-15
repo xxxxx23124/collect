@@ -10,9 +10,9 @@ from DDPM import DDPM
 def run_training(
         model_cls,
         dataset,
-        epochs=100,
+        epochs=200,
         batch_size=64,
-        accumulation_steps=4,  # 累积几步更新一次 (等效 Batch Size = 64 * 4 = 256)
+        accumulation_steps=4,  # 累积几步更新一次
         lr=2e-4,
         device="cuda",
         save_path="ddpm_cat.pth"
