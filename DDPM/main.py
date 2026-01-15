@@ -1,8 +1,8 @@
 import torch
 
-from DDPM.catdataset import CatDataset
-from DDPM.train import run_training
-from DDPM.UNet import DiffusionUNet_64
+from catdataset import CatDataset
+from train import run_training
+from UNet import DiffusionUNet_64
 
 
 if __name__ == "__main__":

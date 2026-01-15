@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from tqdm import tqdm
 
-from DDPM.DDPM import DDPM
+from DDPM import DDPM
 
 
 def run_training(
