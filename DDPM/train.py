@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 from DDPM.DDPM import DDPM
@@ -87,8 +88,10 @@ def run_training(
             # torch.save(ddpm.model.state_dict(), save_path)
             # print(f"💾 Model saved to {save_path}")
 
-            # 简单采样测试
-            generated_imgs = ddpm.sample(num_samples=4, img_size=64)
-            # 可以添加保存图片的代码...
+            # 采样并保存图片
+            print("🎨 Sampling images...")
+            generated_imgs = ddpm.sample(num_samples=8, img_size=64)  # 生成 8 张
+            save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
+            print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
 
     print("✅ Training Finished!")
