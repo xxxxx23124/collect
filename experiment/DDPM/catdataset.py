@@ -6,6 +6,9 @@ from PIL import Image
 
 
 class CatDataset(Dataset):
+    """
+    来自 https://www.kaggle.com/datasets/veeralakrishna/cat-faces-dataset 数据集
+    """
     def __init__(self, image_size=64):
         super().__init__()
 
