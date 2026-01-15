@@ -11,8 +11,8 @@ def run_training(
         model_cls,
         dataset,
         epochs=100,
-        batch_size=32,
-        accumulation_steps=4,  # 累积几步更新一次 (等效 Batch Size = 32 * 4 = 128)
+        batch_size=64,
+        accumulation_steps=4,  # 累积几步更新一次 (等效 Batch Size = 64 * 4 = 256)
         lr=2e-4,
         device="cuda",
         save_path="ddpm_cat.pth"
