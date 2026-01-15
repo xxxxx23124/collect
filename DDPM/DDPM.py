@@ -88,7 +88,9 @@ class DDPM(nn.Module):
         x_t, noise = self.add_noise(x_0, t)
 
         # 3. 神经网络预测噪声
-        predicted_noise = self.model(x_t, t)
+        t_normalized = t.float() / self.timesteps
+        # 用了 GaussianFourierProjection，所以 必须归一化
+        predicted_noise = self.model(x_t, t_normalized)
 
         # 4. 计算 MSE Loss
         loss = F.mse_loss(predicted_noise, noise)
@@ -110,7 +112,9 @@ class DDPM(nn.Module):
             t = (torch.ones(num_samples) * i).long().to(self.device)
 
             # 预测噪声
-            predicted_noise = self.model(x, t)
+            t_normalized = t.float() / self.timesteps
+            # 用了 GaussianFourierProjection，所以 必须归一化
+            predicted_noise = self.model(x, t_normalized)
 
             # 计算均值 mu
             # 公式: x_{t-1} = 1/sqrt(alpha) * (x_t - (beta / sqrt(1-alpha_hat)) * eps)
