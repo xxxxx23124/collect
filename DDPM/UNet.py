@@ -476,7 +476,7 @@ class DualPathBlock(nn.Module):
         # 这样初始时，new_res * gamma_res ≈ 0，相当于恒等映射
         self.gamma_res = nn.Parameter(1e-6 * torch.ones(res_channels), requires_grad=True)
 
-        # 对于 Dense 部分，小一些是为了稳定训练，但一定不能接近0
+        # 对于 Dense 部分，小一些是为了稳定训练，小一些，dense连接对后层的方差影响比较小
         # 需要比gamma_res大，以防止Dense路径失活
         self.gamma_dense = nn.Parameter(1e-2 * torch.ones(dense_inc), requires_grad=True)
 
@@ -947,7 +947,6 @@ class TimeAwareToRGB(nn.Module):
         # 使用 AdaCLN 做最后的归一化，确保去噪结束时的分布也受时间控制
         self.norm = AdaCLN(in_channels, time_emb_dim)
         self.act = nn.GELU()
-        # 使用 1x1 卷积将通道数压缩到 3
         self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
 
     def forward(self, x, time_emb):
