@@ -9,35 +9,44 @@ class DDPM(nn.Module):
                  model,
                  timesteps=1000,
                  beta_start=1e-4,
-                 beta_end=0.02,
-                 device="cuda"):
+                 beta_end=0.02,):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
-        self.device = device
-
-        # 将模型移至设备
-        self.model.to(device)
 
         # ============================================================
-        # 1. 预计算扩散过程所需的常数 (Linear Schedule)
+        # 1. 预计算扩散过程所需的常数
         # ============================================================
-        self.beta = torch.linspace(beta_start, beta_end, timesteps).to(device)
-        self.alpha = 1.0 - self.beta
-        # alpha_hat (cumulative product)
-        self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+        # 先在 CPU 上计算好所有数值，最后统一注册
+        # 当对 ddpm 实例调用 .to(device) 时，它们会自动移动
 
-        # 预先计算常用的平方根，避免训练时重复计算
-        self.sqrt_alpha_hat = torch.sqrt(self.alpha_hat)
-        self.sqrt_one_minus_alpha_hat = torch.sqrt(1.0 - self.alpha_hat)
+        beta = torch.linspace(beta_start, beta_end, timesteps)
+        alpha = 1.0 - beta
+        alpha_hat = torch.cumprod(alpha, dim=0)
 
-        # 反向过程所需的常数 (用于采样公式)
-        # mu = 1/sqrt(alpha) * (x_t - beta/sqrt(1-alpha_hat) * epsilon)
-        self.inv_sqrt_alpha = 1.0 / torch.sqrt(self.alpha)
-        self.denoise_coeff = self.beta / self.sqrt_one_minus_alpha_hat
+        # 注册为 buffer (会自动加入 state_dict，并随模型移动设备)
+        self.register_buffer("beta", beta)
+        self.register_buffer("alpha", alpha)
+        self.register_buffer("alpha_hat", alpha_hat)
+
+        # 预计算常用的平方根
+        self.register_buffer("sqrt_alpha_hat", torch.sqrt(alpha_hat))
+        self.register_buffer("sqrt_one_minus_alpha_hat", torch.sqrt(1.0 - alpha_hat))
+
+        # 反向过程所需的常数
+        # mu计算中的系数
+        inv_sqrt_alpha = 1.0 / torch.sqrt(alpha)
+        denoise_coeff = beta / torch.sqrt(1.0 - alpha_hat)
+
+        self.register_buffer("inv_sqrt_alpha", inv_sqrt_alpha)
+        self.register_buffer("denoise_coeff", denoise_coeff)
 
         # Sigma (方差)
-        self.sigma = torch.sqrt(self.beta)
+        self.register_buffer("sigma", torch.sqrt(beta))
+
+    @property
+    def device(self):
+        return self.beta.device
 
     def extract(self, a, t, x_shape):
         """

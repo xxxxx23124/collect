@@ -1,0 +1,94 @@
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from DDPM.DDPM import DDPM
+
+
+def run_training(
+        model_cls,
+        dataset,
+        epochs=100,
+        batch_size=32,
+        accumulation_steps=4,  # 累积几步更新一次 (等效 Batch Size = 32 * 4 = 128)
+        lr=2e-4,
+        device="cuda",
+        save_path="ddpm_cat.pth"
+):
+    # 1. 初始化模型和 DDPM
+    unet = model_cls(in_channels=3, time_emb_dim=256)
+    ddpm = DDPM(model=unet, timesteps=1000).to(device)
+
+    # 2. 数据加载器
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    # 3. 优化器和调度器
+    optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=1e-4)
+
+    # 余弦退火调度器，T_max 设为总步数或 Epoch 数
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    # 4. 训练循环
+    global_step = 0
+
+    print(f"🚀 Start Training on {device}...")
+    print(f"   Batch Size: {batch_size}, Accumulation: {accumulation_steps}")
+    print(f"   Effective Batch Size: {batch_size * accumulation_steps}")
+
+    for epoch in range(epochs):
+        ddpm.train()
+        epoch_loss = 0.0
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
+
+        for step, batch in enumerate(progress_bar):
+            # 假设 dataset 返回的是 (image, label) 或者 image
+            # 我们只需要 image
+            if isinstance(batch, (list, tuple)):
+                images = batch[0]
+            else:
+                images = batch
+
+            images = images.to(device)
+
+            # 重要：DDPM 假设输入在 [-1, 1]，如果 DataLoader 输出是 [0, 1]，需要转换
+            # images = images * 2.0 - 1.0
+
+            # ================= 计算 Loss =================
+            loss = ddpm.compute_loss(images)
+
+            # ================= 梯度累积 =================
+            # Loss 除以累积步数，因为 backward 会累加梯度
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            # 只有满足累积步数时才进行更新
+            if (step + 1) % accumulation_steps == 0:
+                # 梯度裁剪 (Max Norm 通常设为 1.0)
+                torch.nn.utils.clip_grad_norm_(ddpm.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+            # 还原 Loss 数值用于打印
+            loss_val = loss.item() * accumulation_steps
+            epoch_loss += loss_val
+
+            progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"})
+
+        # 每个 Epoch 结束后调整学习率
+        scheduler.step()
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"📉 Epoch {epoch + 1} Average Loss: {avg_loss:.4f}")
+
+        # 每隔 10 个 epoch 保存一次，并尝试采样看效果
+        if (epoch + 1) % 10 == 0:
+            # torch.save(ddpm.model.state_dict(), save_path)
+            # print(f"💾 Model saved to {save_path}")
+
+            # 简单采样测试
+            generated_imgs = ddpm.sample(num_samples=4, img_size=64)
+            # 可以添加保存图片的代码...
+
+    print("✅ Training Finished!")

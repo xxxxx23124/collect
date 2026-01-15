@@ -68,9 +68,9 @@ class TimeMLP(nn.Module):
     """
 
     def __init__(self,
-                 time_emb_dim=256,  # 最终输出维度 (也就是 U-Net 里的 time_emb_dim)
-                 hidden_dim=512,  # 内部隐层维度 (建议比 time_emb_dim 大)
-                 num_layers=4,  # 深度：4 层足够产生非线性极强的控制信号
+                 time_emb_dim=256,
+                 hidden_dim=512,
+                 num_layers=4,
                  fourier_scale=16.0):  # 频率缩放系数
         super().__init__()
 
@@ -1028,7 +1028,7 @@ class TimeAwareToRGB(nn.Module):
             return main_path(x, time_emb)
 
 
-class CatDiffusionUNet(nn.Module):
+class DiffusionUNet_64(nn.Module):
     def __init__(self, in_channels=3, time_emb_dim=256):
         super().__init__()
         self.time_emb_dim = time_emb_dim
@@ -1148,7 +1148,7 @@ if __name__ == "__main__":
     print(f"Testing on {device}")
 
     # 1. 实例化模型
-    model = CatDiffusionUNet(in_channels=3, time_emb_dim=256).to(device)
+    model = DiffusionUNet_64(in_channels=3, time_emb_dim=256).to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
