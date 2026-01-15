@@ -949,14 +949,12 @@ class TimeAwareToRGB(nn.Module):
         self.act = nn.GELU()
         # 使用 1x1 卷积将通道数压缩到 3
         self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
-        self.gamma = nn.Parameter(1e-6 * torch.ones(out_channels), requires_grad=True)
 
     def forward(self, x, time_emb):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
             x_in = self.norm(x_in, time_emb_in)
             x_in = self.act(x_in)
-            x_in = self.conv(x_in, time_emb_in)
-            return x_in * self.gamma.view(1, -1, 1, 1)
+            return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
 
