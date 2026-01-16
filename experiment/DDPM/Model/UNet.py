@@ -42,6 +42,118 @@ class GaussianFourierProjection(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
+class RoPE2D(nn.Module):
+    """
+    2D 旋转位置编码 (Rotary Position Embedding)
+    将 head_dim 的前半部分用于编码 Y(高度) 位置，后半部分用于编码 X(宽度) 位置。
+
+    Args:
+        dim: head dimension，必须是偶数
+        height: 图像/特征图的高度（patch 数量）
+        width: 图像/特征图的宽度（patch 数量）
+        base: RoPE 的基础频率 这里我们选用100，因为处理的范围是在8-16，然后在注意力计算中，这个是cos（竖直对）+ cos（水平对）的累加和，
+        类似曼哈顿距离，这种情况下，100 Max Wavelength大约628 像素，既没有混叠（远大于16），又有足够的区分度。
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            height: int,
+            width: int,
+            base: float = 100.0
+    ):
+        super().__init__()
+
+        assert dim % 4 == 0, f"dim must be 4*n, got 4*{dim // 4}+{dim % 4}"
+
+        self.dim = dim
+        self.height = height
+        self.width = width
+        self.base = base
+
+        half_dim = dim // 2  # 每个轴分配的维度
+        quarter_dim = half_dim // 2  # 用于生成频率的维度
+
+        # 1. 生成逆频率
+        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
+
+        # 2. 生成 Height (Y) 的位置编码
+        t_y = torch.arange(height, dtype=torch.float)
+        freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)  # (H, quarter_dim)
+        emb_y = torch.cat((freqs_y, freqs_y), dim=-1)  # (H, half_dim)
+
+        # 3. 生成 Width (X) 的位置编码
+        t_x = torch.arange(width, dtype=torch.float)
+        freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)  # (W, quarter_dim)
+        emb_x = torch.cat((freqs_x, freqs_x), dim=-1)  # (W, half_dim)
+
+        # 4. 广播构建全图 Grid
+        # Y轴编码: (H, 1, half_dim) -> (H, W, half_dim)
+        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
+
+        # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
+        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
+
+        # 5. 拼接 -> (H, W, dim)
+        emb_full = torch.cat([emb_y_grid, emb_x_grid], dim=-1)
+
+        # 拉平为序列形式 -> (H*W, dim)
+        freqs = emb_full.reshape(-1, dim)
+
+        # 6. 预计算并注册 cos/sin 缓存
+        # shape: (1, 1, H*W, dim) 方便广播
+        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            seq_len: int = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        对 query 和 key 应用 2D 旋转位置编码
+
+        Args:
+            q: Query tensor, shape (B, num_heads, SeqLen, head_dim)
+            k: Key tensor, shape (B, num_heads, SeqLen, head_dim)
+            seq_len: 可选，实际序列长度（用于处理变长序列）
+
+        Returns:
+            tuple: 应用位置编码后的 (q, k)
+        """
+        if seq_len is None:
+            seq_len = q.shape[2]
+
+        # 获取对应长度的 cos/sin
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+
+        q_embed = self.apply_rotary_pos_emb(q, cos, sin)
+        k_embed = self.apply_rotary_pos_emb(k, cos, sin)
+
+        return q_embed, k_embed
+
+    def apply_rotary_pos_emb(
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        应用旋转位置编码
+        x: (B, H, SeqLen, Dim)
+        cos, sin: (1, 1, SeqLen, Dim)
+        """
+        return (x * cos) + (self.rotate_half(x) * sin)
+
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """将张量的后半部分旋转到前面，并取负"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+
 class ResMLPBlock(nn.Module):
     """
     带残差连接的 MLP Block，允许网络做得更深而不梯度消失
@@ -52,11 +164,11 @@ class ResMLPBlock(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, dim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(dim, dim),
             nn.Dropout(dropout)
         )
-        self.act = nn.GELU()
+        self.act = nn.SiLU()
 
     def forward(self, x):
         return self.act(x + self.net(x))
@@ -115,18 +227,17 @@ class TimeMLP(nn.Module):
 class TimeModulator(nn.Module):
     """
     用于 AdaCLN 和 AdaGRN 的时间映射模块
-    结构: Linear -> GELU -> Linear
+    结构: Linear -> SiLU -> Linear
     """
 
-    def __init__(self, time_emb_dim, out_channels, gamma_init_value=0.0):
+    def __init__(self, time_emb_dim, out_channels, init_value=0.0):
         super().__init__()
-        assert out_channels % 2 == 0, "TimeModulator's out_channels must be even for two part [gamma, beta]"
         self.out_channels = out_channels
-        self.gamma_init_value = gamma_init_value  # 保存期望的 gamma 初始值
+        self.init_value = init_value
 
         self.net = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(time_emb_dim, out_channels)
         )
 
@@ -138,15 +249,7 @@ class TimeModulator(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
 
         # 2. 最后一层的偏置 bias 进行特殊初始化
-        # 我们假设 out_channels 是 [gamma, beta] 的拼接
-        # 前一半是 gamma，后一半是 beta
-        half_dim = self.out_channels // 2
-
-        # 初始化 Gamma 部分 (Bias)
-        nn.init.constant_(self.net[-1].bias[:half_dim], self.gamma_init_value)
-
-        # 初始化 Beta 部分 (Bias) 始终为 0
-        nn.init.constant_(self.net[-1].bias[half_dim:], 0.0)
+        nn.init.constant_(self.net[-1].bias, self.init_value)
 
     def forward(self, x):
         return self.net(x)
@@ -171,7 +274,7 @@ class TimeAttentionRouter(nn.Module):
         # 在 64 维的隐空间里做交互，参数量(64*64*2)
         self.channel_mixer = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim)
         )
 
@@ -759,117 +862,6 @@ class UpsampleLayer(nn.Module):
         return main_path(x, time_emb)
 
 
-class RoPE2D(nn.Module):
-    """
-    2D 旋转位置编码 (Rotary Position Embedding)
-    将 head_dim 的前半部分用于编码 Y(高度) 位置，后半部分用于编码 X(宽度) 位置。
-
-    Args:
-        dim: head dimension，必须是偶数
-        height: 图像/特征图的高度（patch 数量）
-        width: 图像/特征图的宽度（patch 数量）
-        base: RoPE 的基础频率
-    """
-
-    def __init__(
-            self,
-            dim: int,
-            height: int,
-            width: int,
-            base: float = 10000.0
-    ):
-        super().__init__()
-
-        assert dim % 4 == 0, f"dim must be 4*n, got 4*{dim // 4}+{dim % 4}"
-
-        self.dim = dim
-        self.height = height
-        self.width = width
-        self.base = base
-
-        half_dim = dim // 2  # 每个轴分配的维度
-        quarter_dim = half_dim // 2  # 用于生成频率的维度
-
-        # 1. 生成逆频率
-        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
-
-        # 2. 生成 Height (Y) 的位置编码
-        t_y = torch.arange(height, dtype=torch.float)
-        freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)  # (H, quarter_dim)
-        emb_y = torch.cat((freqs_y, freqs_y), dim=-1)  # (H, half_dim)
-
-        # 3. 生成 Width (X) 的位置编码
-        t_x = torch.arange(width, dtype=torch.float)
-        freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)  # (W, quarter_dim)
-        emb_x = torch.cat((freqs_x, freqs_x), dim=-1)  # (W, half_dim)
-
-        # 4. 广播构建全图 Grid
-        # Y轴编码: (H, 1, half_dim) -> (H, W, half_dim)
-        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
-
-        # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
-        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
-
-        # 5. 拼接 -> (H, W, dim)
-        emb_full = torch.cat([emb_y_grid, emb_x_grid], dim=-1)
-
-        # 拉平为序列形式 -> (H*W, dim)
-        freqs = emb_full.reshape(-1, dim)
-
-        # 6. 预计算并注册 cos/sin 缓存
-        # shape: (1, 1, H*W, dim) 方便广播
-        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
-
-    def forward(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            seq_len: int = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        对 query 和 key 应用 2D 旋转位置编码
-
-        Args:
-            q: Query tensor, shape (B, num_heads, SeqLen, head_dim)
-            k: Key tensor, shape (B, num_heads, SeqLen, head_dim)
-            seq_len: 可选，实际序列长度（用于处理变长序列）
-
-        Returns:
-            tuple: 应用位置编码后的 (q, k)
-        """
-        if seq_len is None:
-            seq_len = q.shape[2]
-
-        # 获取对应长度的 cos/sin
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
-
-        q_embed = self.apply_rotary_pos_emb(q, cos, sin)
-        k_embed = self.apply_rotary_pos_emb(k, cos, sin)
-
-        return q_embed, k_embed
-
-    def apply_rotary_pos_emb(
-            self,
-            x: torch.Tensor,
-            cos: torch.Tensor,
-            sin: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        应用旋转位置编码
-        x: (B, H, SeqLen, Dim)
-        cos, sin: (1, 1, SeqLen, Dim)
-        """
-        return (x * cos) + (self.rotate_half(x) * sin)
-
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """将张量的后半部分旋转到前面，并取负"""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-
 class TimeAwareSelfAttention(nn.Module):
     """
     带 AdaCLN 调制的多头自注意力机制 (MHSA)。
@@ -883,11 +875,10 @@ class TimeAwareSelfAttention(nn.Module):
                  time_emb_dim: int,
                  resolution: tuple | int,
                  num_heads: int=4,
-                 head_dim: int=64):
+                 head_dim: int=64,
+                 use_rope=True):
         super().__init__()
         self.num_heads = num_heads
-        # 如果不手动指定 scale，SDPA 默认就是 1/sqrt(dim)，但在显式传参时我们通常保留这个属性
-        self.scale = head_dim ** -0.5
         inner_dim = num_heads * head_dim
 
         # AdaCLN，这是 TimeAware 的核心
@@ -899,18 +890,19 @@ class TimeAwareSelfAttention(nn.Module):
         # 输出投影
         self.to_out = nn.Linear(inner_dim, channels)
 
-        if isinstance(resolution, int):
-            self.resolution = (resolution, resolution)
-        else:
-            self.resolution = resolution
-
-        # 初始化 RoPE
-        # 这里的 dim 必须对应 head_dim，而不是 channels
-        self.rope = RoPE2D(
-            dim=head_dim,
-            height=self.resolution[0],
-            width=self.resolution[1]
-        )
+        self.use_rope = use_rope
+        if use_rope:
+            if isinstance(resolution, int):
+                self.resolution = (resolution, resolution)
+            else:
+                self.resolution = resolution
+            # 初始化 RoPE
+            # 这里的 dim 必须对应 head_dim，而不是 channels
+            self.rope = RoPE2D(
+                dim=head_dim,
+                height=self.resolution[0],
+                width=self.resolution[1]
+            )
 
     def forward(self, x, time_emb):
         """
@@ -941,10 +933,11 @@ class TimeAwareSelfAttention(nn.Module):
             k = k.view(B, N, self.num_heads, -1).transpose(1, 2)
             v = v.view(B, N, self.num_heads, -1).transpose(1, 2)
 
-            # 应用 RoPE
-            # RoPE 期望输入: (B, H, SeqLen, HeadDim)
-            # 输出形状保持不变
-            q, k = self.rope(q, k)
+            if self.use_rope:
+                # 应用 RoPE
+                # RoPE 期望输入: (B, H, SeqLen, HeadDim)
+                # 输出形状保持不变
+                q, k = self.rope(q, k)
 
             # 3. Flash Attention (核心加速步骤)
             # PyTorch 会自动处理 Mask (这里没有 mask) 和 Scale
@@ -952,8 +945,7 @@ class TimeAwareSelfAttention(nn.Module):
                 q, k, v,
                 attn_mask=None,
                 dropout_p=0.0,
-                is_causal=False,
-                scale=self.scale
+                is_causal=False
             )
 
             # 4. 还原形状
@@ -1080,13 +1072,232 @@ class TimeAwareToRGB(nn.Module):
         self.act = nn.GELU()
         self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
 
-    def forward(self, x, time_emb):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
             x_in = self.norm(x_in, time_emb_in)
             x_in = self.act(x_in)
             return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
+
+
+class AdaRMSNorm(nn.Module):
+    def __init__(self, dim, time_emb_dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+
+        # 只需要调节 scale，不需要 shift (RMSNorm 特性)
+        # 初始化 weights 为 0，确保初始状态近似标准 RMSNorm
+        # 分batch - 微调
+        self.time_proj = TimeModulator(time_emb_dim, dim, 0)
+
+        # 可学习的基础 scale，类似于 PyTorch RMSNorm 中的 weight
+        # 全局 - 不分batch
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+
+            # x: (B, N, C)
+            # time_emb: (B, T_dim)
+
+            # 1. 标准 RMSNorm 计算
+            # x.pow(2).mean(-1) 计算均方值
+            norm_x = x_in * torch.rsqrt(x_in.pow(2).mean(-1, keepdim=True) + self.eps)
+
+            # 2. 应用基础 Scale
+            norm_x = norm_x * self.scale
+
+            # 3. 时间调制
+            # (1 + scale_t) 保证初始状态下是一个 Identity 调制
+            time_scale = self.time_proj(time_emb_in).unsqueeze(1)  # (B, 1, C)
+            return norm_x * (1 + time_scale)
+
+        return main_path(x, time_emb)
+
+
+class TimeAwareSwiGLU(nn.Module):
+    def __init__(self, dim, hidden_dim, time_emb_dim):
+        super().__init__()
+
+        # 内容映射: 产生 Gate 的部分 和 Value 的部分
+        self.w_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.w_val = nn.Linear(dim, hidden_dim, bias=False)
+
+        # 时间映射: 产生对 Gate 的控制信号
+        self.w_time = TimeModulator(time_emb_dim, hidden_dim, 0)
+
+        # 输出映射
+        self.w_out = nn.Linear(hidden_dim, dim, bias=False)
+
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            """
+            x: (B, N, C)
+            time_emb: (B, T_dim)
+            """
+            # 1. 投影内容
+            c_gate = self.w_gate(x_in)  # (B, N, H)
+            val = self.w_val(x_in)  # (B, N, H)
+
+            # 2. 投影时间
+            # 时间在这里充当一个全局的 Filter，对当前Batch的所有token作用一致
+            t_gate = self.w_time(time_emb_in).unsqueeze(1)  # (B, 1, H)
+
+            # 3. 时间感知门控 (Time-Aware Gating)
+            gate = self.act(c_gate * (1 + t_gate))
+
+            # 4. 应用门控并输出
+            out = self.w_out(gate * val)
+            return out
+
+        return main_path(x, time_emb)
+
+
+class TimeAwareTransformerBlock(nn.Module):
+    def __init__(self,
+                 dim,
+                 time_emb_dim,
+                 resolution: tuple | int,
+                 num_heads=8,
+                 ffn_mult=4,
+                 use_rope=True):
+        super().__init__()
+        self.head_dim = dim // num_heads
+        self.num_heads = num_heads
+        self.use_rope = use_rope
+
+        # Attention Norm
+        self.norm1 = AdaRMSNorm(dim, time_emb_dim)
+
+        # Self Attention
+        self.attn_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.attn_out = nn.Linear(dim, dim, bias=False)
+
+        # FFN Norm
+        self.norm2 = AdaRMSNorm(dim, time_emb_dim)
+
+        # Time-Aware SwiGLU
+        hidden_dim = int(dim * ffn_mult)
+        self.ffn = TimeAwareSwiGLU(dim, hidden_dim, time_emb_dim)
+
+        if use_rope:
+            if isinstance(resolution, int):
+                self.resolution = (resolution, resolution)
+            else:
+                self.resolution = resolution
+
+            # 初始化 RoPE
+            # 这里的 dim 必须对应 head_dim，而不是 channels
+            self.rope = RoPE2D(
+                dim=self.head_dim,
+                height=self.resolution[0],
+                width=self.resolution[1]
+            )
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
+        # x: (B, N, C), N = H*W
+        B, N, C = x.shape
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            # Attention Block
+            residual = x_in
+            x_in = self.norm1(x_in, time_emb_in)
+
+            # QKV
+            qkv = self.attn_qkv(x_in).chunk(3, dim=-1)
+            q, k, v = map(lambda t: t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2), qkv)
+
+            # RoPE Injection
+            if self.use_rope:
+                # RoPE 期望输入: (B, H, SeqLen, HeadDim)
+                q, k = self.rope(q, k)
+
+            # Flash Attention
+            x_in = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            x_in = x_in.transpose(1, 2).contiguous().view(B, N, C)
+            x_in = self.attn_out(x_in)
+            x_in = residual + x_in
+
+            # Time-Aware FFN Block
+            residual = x_in
+            x_in = self.norm2(x_in, time_emb_in)
+            x_in = self.ffn(x_in, time_emb_in)
+            x_in = residual + x_in
+
+            return x_in
+
+        return main_path(x, time_emb)
+
+
+class BottleneckTransformerStage(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 inner_dim: int,
+                 num_layers: int,
+                 time_emb_dim: int,
+                 resolution: tuple | int,
+                 num_heads: int,
+                 ffn_mult: int=4,
+                 use_condconv:bool=True):
+        super().__init__()
+        def make_conv(in_c, out_c, k=1, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=True,
+                    num_experts=4
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        self.proj_in = make_conv(in_channels, inner_dim, 1)
+        self.layers = nn.ModuleList([
+            TimeAwareTransformerBlock(
+                dim=inner_dim,
+                time_emb_dim=time_emb_dim,
+                resolution=resolution,
+                num_heads=num_heads,
+                ffn_mult=ffn_mult
+            )
+            for _ in range(num_layers)
+        ])
+        self.proj_out = make_conv(inner_dim, out_channels, 1)
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            x_in = self.proj_in(x_in, time_emb_in)
+
+            # Input: (B, C, H, W)
+            B, C, H, W = x_in.shape
+
+            # Flatten: (B, C, H, W) -> (B, N, C)
+            x_in = x_in.flatten(2).transpose(1, 2)
+
+            for layer in self.layers:
+                # 传入 H, W 是为了 RoPE 计算
+                x_in = layer(x_in, time_emb_in)
+
+            # Unflatten: (B, N, C) -> (B, C, H, W)
+            x_in = x_in.transpose(1, 2).view(B, C, H, W)
+
+            x_in = self.proj_out(x_in, time_emb_in)
+
+            return x_in
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
 
 
 class DiffusionUNet_64(nn.Module):
@@ -1112,15 +1323,13 @@ class DiffusionUNet_64(nn.Module):
 
         # Enc3: 256ch
         self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
-        self.att3 = TimeAwareSelfAttention(288, time_emb_dim, num_heads=4)  # 256 + 2*16 = 288
+        self.att3 = TimeAwareSelfAttention(288, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
         # Down3: 288 -> 384
         self.down3 = DownsampleLayer(288, 384, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
-        # Bot: 384ch
-        self.bot_stage = DualPathStage(384, 384, num_blocks=4, dense_inc=16, groups=8,
-                                       time_emb_dim=time_emb_dim)
-        self.bot_att = TimeAwareSelfAttention(448, time_emb_dim, num_heads=6)  # 384 + 4*16 = 448
+        self.bot_stage = BottleneckTransformerStage(384, 448, 512, 6,
+                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=8)
 
         # ================= DECODER =================
 
@@ -1134,7 +1343,7 @@ class DiffusionUNet_64(nn.Module):
 
         # Stage: 处理 384 通道
         self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
-        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim, num_heads=6)  # 384 + 2*16 = 416
+        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim, resolution=16, num_heads=6)  # 384 + 2*16 = 416
 
         # --- Up 2 (16x16 -> 32x32) ---
         # Dec1 Out (416) -> Up (256)
@@ -1178,7 +1387,6 @@ class DiffusionUNet_64(nn.Module):
 
         # Bottleneck
         x = self.bot_stage(x, t_emb)
-        x = self.bot_att(x, t_emb)
 
         # Decoder
         # Layer 1
