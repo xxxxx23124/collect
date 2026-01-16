@@ -759,6 +759,117 @@ class UpsampleLayer(nn.Module):
         return main_path(x, time_emb)
 
 
+class RoPE2D(nn.Module):
+    """
+    2D 旋转位置编码 (Rotary Position Embedding)
+    将 head_dim 的前半部分用于编码 Y(高度) 位置，后半部分用于编码 X(宽度) 位置。
+
+    Args:
+        dim: head dimension，必须是偶数
+        height: 图像/特征图的高度（patch 数量）
+        width: 图像/特征图的宽度（patch 数量）
+        base: RoPE 的基础频率
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            height: int,
+            width: int,
+            base: float = 10000.0
+    ):
+        super().__init__()
+
+        assert dim % 4 == 0, f"dim must be 4*n, got 4*{dim // 4}+{dim % 4}"
+
+        self.dim = dim
+        self.height = height
+        self.width = width
+        self.base = base
+
+        half_dim = dim // 2  # 每个轴分配的维度
+        quarter_dim = half_dim // 2  # 用于生成频率的维度
+
+        # 1. 生成逆频率
+        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
+
+        # 2. 生成 Height (Y) 的位置编码
+        t_y = torch.arange(height, dtype=torch.float)
+        freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)  # (H, quarter_dim)
+        emb_y = torch.cat((freqs_y, freqs_y), dim=-1)  # (H, half_dim)
+
+        # 3. 生成 Width (X) 的位置编码
+        t_x = torch.arange(width, dtype=torch.float)
+        freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)  # (W, quarter_dim)
+        emb_x = torch.cat((freqs_x, freqs_x), dim=-1)  # (W, half_dim)
+
+        # 4. 广播构建全图 Grid
+        # Y轴编码: (H, 1, half_dim) -> (H, W, half_dim)
+        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
+
+        # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
+        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
+
+        # 5. 拼接 -> (H, W, dim)
+        emb_full = torch.cat([emb_y_grid, emb_x_grid], dim=-1)
+
+        # 拉平为序列形式 -> (H*W, dim)
+        freqs = emb_full.reshape(-1, dim)
+
+        # 6. 预计算并注册 cos/sin 缓存
+        # shape: (1, 1, H*W, dim) 方便广播
+        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            seq_len: int = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        对 query 和 key 应用 2D 旋转位置编码
+
+        Args:
+            q: Query tensor, shape (B, num_heads, SeqLen, head_dim)
+            k: Key tensor, shape (B, num_heads, SeqLen, head_dim)
+            seq_len: 可选，实际序列长度（用于处理变长序列）
+
+        Returns:
+            tuple: 应用位置编码后的 (q, k)
+        """
+        if seq_len is None:
+            seq_len = q.shape[2]
+
+        # 获取对应长度的 cos/sin
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+
+        q_embed = self.apply_rotary_pos_emb(q, cos, sin)
+        k_embed = self.apply_rotary_pos_emb(k, cos, sin)
+
+        return q_embed, k_embed
+
+    def apply_rotary_pos_emb(
+            self,
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        应用旋转位置编码
+        x: (B, H, SeqLen, Dim)
+        cos, sin: (1, 1, SeqLen, Dim)
+        """
+        return (x * cos) + (self.rotate_half(x) * sin)
+
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """将张量的后半部分旋转到前面，并取负"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+
 class TimeAwareSelfAttention(nn.Module):
     """
     带 AdaCLN 调制的多头自注意力机制 (MHSA)。
@@ -768,10 +879,11 @@ class TimeAwareSelfAttention(nn.Module):
     """
 
     def __init__(self,
-                 channels,
-                 time_emb_dim,
-                 num_heads=4,
-                 head_dim=64):
+                 channels: int,
+                 time_emb_dim: int,
+                 resolution: tuple | int,
+                 num_heads: int=4,
+                 head_dim: int=64):
         super().__init__()
         self.num_heads = num_heads
         # 如果不手动指定 scale，SDPA 默认就是 1/sqrt(dim)，但在显式传参时我们通常保留这个属性
@@ -787,6 +899,19 @@ class TimeAwareSelfAttention(nn.Module):
         # 输出投影
         self.to_out = nn.Linear(inner_dim, channels)
 
+        if isinstance(resolution, int):
+            self.resolution = (resolution, resolution)
+        else:
+            self.resolution = resolution
+
+        # 初始化 RoPE
+        # 这里的 dim 必须对应 head_dim，而不是 channels
+        self.rope = RoPE2D(
+            dim=head_dim,
+            height=self.resolution[0],
+            width=self.resolution[1]
+        )
+
     def forward(self, x, time_emb):
         """
         x: (B, C, H, W)
@@ -794,6 +919,7 @@ class TimeAwareSelfAttention(nn.Module):
         """
         B, C, H, W = x.shape
         N = H * W
+        assert (H, W) == self.resolution, f"Input resolution ({H},{W}) does not match initialized resolution {self.resolution}"
 
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
             # 1. AdaCLN Norm & Reshape (Image -> Sequence)
@@ -814,6 +940,11 @@ class TimeAwareSelfAttention(nn.Module):
             q = q.view(B, N, self.num_heads, -1).transpose(1, 2)
             k = k.view(B, N, self.num_heads, -1).transpose(1, 2)
             v = v.view(B, N, self.num_heads, -1).transpose(1, 2)
+
+            # 应用 RoPE
+            # RoPE 期望输入: (B, H, SeqLen, HeadDim)
+            # 输出形状保持不变
+            q, k = self.rope(q, k)
 
             # 3. Flash Attention (核心加速步骤)
             # PyTorch 会自动处理 Mask (这里没有 mask) 和 Scale
