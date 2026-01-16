@@ -1328,8 +1328,8 @@ class DiffusionUNet_64(nn.Module):
         self.down3 = DownsampleLayer(288, 384, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
-        self.bot_stage = BottleneckTransformerStage(384, 448, 512, 6,
-                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=8)
+        self.bot_stage = BottleneckTransformerStage(384, 448, 768, num_layers=8,
+                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=12)
 
         # ================= DECODER =================
 
