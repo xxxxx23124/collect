@@ -18,7 +18,7 @@ def run_training(
         save_path="ddpm_cat.pth"
 ):
     # 1. 初始化模型和 DDPM
-    unet = model_cls(in_channels=3, time_emb_dim=256)
+    unet = model_cls()
     ddpm = DDPM(model=unet, timesteps=1000).to(device)
 
     # 2. 数据加载器

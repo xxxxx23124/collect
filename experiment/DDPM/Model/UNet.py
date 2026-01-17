@@ -1446,7 +1446,7 @@ if __name__ == "__main__":
     print(f"Testing on {device}")
 
     # 1. 实例化模型
-    model = DiffusionUNet_64(in_channels=3, time_emb_dim=256).to(device)
+    model = DiffusionUNet_64().to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
