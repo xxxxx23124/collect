@@ -1228,10 +1228,12 @@ class TimeAwareTransformerBlock(nn.Module):
                 q, k = self.rope(q, k)
 
             # Flash Attention
-            x_in = F.scaled_dot_product_attention(q, k, v,
-                                                  attn_mask=None,
-                                                  dropout_p=0.0,
-                                                  is_causal=False)
+            x_in = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False
+            )
             x_in = x_in.transpose(1, 2).contiguous().view(B, N, C)
             x_in = self.attn_out(x_in)
             x_in = residual + x_in
