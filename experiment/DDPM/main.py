@@ -1,6 +1,7 @@
 import torch
 
-from catdataset import CatDataset
+from experiment.DDPM.DataSets.catdataset_64 import CatDataset
+from experiment.DDPM.DataSets.ImageNet_64 import ImagenetDataset
 from train import run_training
 from experiment.DDPM.Model.UNet import DiffusionUNet_64
 
@@ -15,7 +16,7 @@ if __name__ == "__main__":
             model_cls=DiffusionUNet_64,
             dataset=dataset,
             epochs=200,  # 训练轮数
-            batch_size=64,  # 批次大小 (根据显存调整)
+            batch_size=32,  # 批次大小 (根据显存调整)
             accumulation_steps=4,  # 梯度累积
             lr=2e-4,
             device="cuda" if torch.cuda.is_available() else "cpu",

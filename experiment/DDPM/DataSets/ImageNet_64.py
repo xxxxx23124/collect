@@ -1,22 +1,20 @@
 import os
-import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 
 
-class CatDataset(Dataset):
+class ImagenetDataset(Dataset):
     """
-    来自 https://www.kaggle.com/datasets/veeralakrishna/cat-faces-dataset 数据集
+    来自 https://www.kaggle.com/datasets/ayaroshevskiy/downsampled-imagenet-64x64/data 数据集
     """
     def __init__(self, image_size=64):
         super().__init__()
 
         # 定义三个文件夹的路径 (使用 r"" 防止转义字符问题)
         self.folders = [
-            r"D:\py\DATA\Cat-faces-dataset-master\dataset-part1\dataset-part1",
-            r"D:\py\DATA\Cat-faces-dataset-master\dataset-part2\dataset-part2",
-            r"D:\py\DATA\Cat-faces-dataset-master\dataset-part3\dataset-part3"
+            r"D:\py\DATA\ImageNet-64x64\train_64x64\train_64x64",
+            r"D:\py\DATA\ImageNet-64x64\valid_64x64\valid_64x64",
         ]
 
         self.image_paths = []
@@ -67,7 +65,7 @@ class CatDataset(Dataset):
 # ================= 测试代码 =================
 if __name__ == "__main__":
     # 简单的测试脚本，看看能不能读出来数据
-    dataset = CatDataset()
+    dataset = ImagenetDataset()
 
     if len(dataset) > 0:
         img = dataset[0]
@@ -81,7 +79,7 @@ if __name__ == "__main__":
 
         # 还原到 [0, 1] 用于保存查看
         save_img = (img + 1) / 2
-        save_image(save_img, "test_cat_sample.png")
+        save_image(save_img, "../test_cat_sample.png")
         print("✅ Sample image saved to 'test_cat_sample.png'")
     else:
         print("❌ No images found. Please check your paths.")

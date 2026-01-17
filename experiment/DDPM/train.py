@@ -90,7 +90,7 @@ def run_training(
 
         # 采样并保存图片
         print("🎨 Sampling images...")
-        generated_imgs = ddpm.sample(num_samples=8, img_size=64)  # 生成 8 张
+        generated_imgs = ddpm.sample(num_samples=32, img_size=64)
         save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
         print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
 

@@ -1341,37 +1341,37 @@ class DiffusionUNet_64(nn.Module):
 
         # ================= ENCODER =================
         # Enc1: 64ch
-        self.enc1 = DualPathStage(64, 64, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.enc1 = DualPathStage(64, 64, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         # Down1: 96 -> 128
         self.down1 = DownsampleLayer(96, 128, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Enc2: 128ch
-        self.enc2 = DualPathStage(128, 128, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.enc2 = DualPathStage(128, 128, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         # Down2: 160 -> 256
         self.down2 = DownsampleLayer(160, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Enc3: 256ch
-        self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         self.att3 = TimeAwareSelfAttention(288, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
         # Down3: 288 -> 384
-        self.down3 = DownsampleLayer(288, 384, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.down3 = DownsampleLayer(288, 512, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
-        self.bot_stage = BottleneckTransformerStage(384, 448, 768, num_layers=8,
-                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=12)
+        self.bot_stage = BottleneckTransformerStage(512, 512, 1024, num_layers=8,
+                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=16)
 
         # ================= DECODER =================
 
         # --- Up 1 (8x8 -> 16x16) ---
         # Bot Out (448) -> Up (256)
-        self.up1 = UpsampleLayer(448, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up1 = UpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up1(256) + Enc3_Skip(288) = 544
         # Fusion: 544 -> 384
         self.fuse1 = FeatureFusionBlock(544, 384, time_emb_dim)
 
         # Stage: 处理 384 通道
-        self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim, resolution=16, num_heads=6)  # 384 + 2*16 = 416
 
         # --- Up 2 (16x16 -> 32x32) ---
@@ -1382,7 +1382,7 @@ class DiffusionUNet_64(nn.Module):
         # Fusion: 352 -> 192
         self.fuse2 = FeatureFusionBlock(352, 192, time_emb_dim)
 
-        self.dec2 = DualPathStage(192, 192, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.dec2 = DualPathStage(192, 192, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         # Dec2 Out: 192 + 32 = 224
 
         # --- Up 3 (32x32 -> 64x64) ---
@@ -1393,7 +1393,7 @@ class DiffusionUNet_64(nn.Module):
         # Fusion: 192 -> 96
         self.fuse3 = FeatureFusionBlock(192, 96, time_emb_dim)
 
-        self.dec3 = DualPathStage(96, 96, num_blocks=2, dense_inc=16, groups=8, time_emb_dim=time_emb_dim)
+        self.dec3 = DualPathStage(96, 96, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         # Dec3 Out: 96 + 32 = 128
 
         # ================= OUTPUT =================
