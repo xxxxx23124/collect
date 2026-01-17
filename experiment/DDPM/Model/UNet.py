@@ -393,6 +393,8 @@ class TimeAwareCondConv2d(nn.Module):
 
         # Calculate routing weights based on Content + Time
         # [B, num_experts]
+        """
+        # 这个部分过去是为了图像检测任务设计，在DDPM中，可能加噪声不合适。
         if self.training:
             gating_logits = self.router(pooled, time_emb)
             # Add noise during training to encourage expert diversity
@@ -400,7 +402,8 @@ class TimeAwareCondConv2d(nn.Module):
             routing_weights = torch.sigmoid(gating_logits + noise)
         else:
             routing_weights = torch.sigmoid(self.router(pooled, time_emb))
-
+        """
+        routing_weights = torch.sigmoid(self.router(pooled, time_emb))
         # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
         # weight_eff: [B, out, in//g, k, k]
         weight_eff = (routing_weights[:, :, None, None, None, None] * self.weight[None]).sum(1)
@@ -1353,7 +1356,7 @@ class DiffusionUNet_64(nn.Module):
         # Enc3: 256ch
         self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
         self.att3 = TimeAwareSelfAttention(288, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
-        # Down3: 288 -> 384
+        # Down3: 288 -> 512
         self.down3 = DownsampleLayer(288, 512, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
@@ -1363,7 +1366,7 @@ class DiffusionUNet_64(nn.Module):
         # ================= DECODER =================
 
         # --- Up 1 (8x8 -> 16x16) ---
-        # Bot Out (448) -> Up (256)
+        # Bot Out (512) -> Up (256)
         self.up1 = UpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up1(256) + Enc3_Skip(288) = 544
