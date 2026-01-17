@@ -5,11 +5,10 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
+
+"""
 # SinusoidalPositionalEmbeddings暂时不启用，因为有GaussianFourierProjection了
 class SinusoidalPositionalEmbeddings(nn.Module):
-    """
-    标准的正弦位置编码，用于将时间 t 映射为向量
-    """
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -22,6 +21,8 @@ class SinusoidalPositionalEmbeddings(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
+"""
+
 
 class GaussianFourierProjection(nn.Module):
     """
@@ -1261,6 +1262,7 @@ class BottleneckTransformerStage(nn.Module):
                 raise TypeError("This feature is not yet implemented.")
 
         self.proj_in = make_conv(in_channels, inner_dim, 1)
+
         self.layers = nn.ModuleList([
             TimeAwareTransformerBlock(
                 dim=inner_dim,
@@ -1271,28 +1273,52 @@ class BottleneckTransformerStage(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.proj_out = make_conv(inner_dim, out_channels, 1)
+
+        # 融合层，加入原因不止是降维，还是Transformer与CNN的语言空间不同
+        # 输入维度是 inner_dim * 2 (因为 concat 了 transformer 的输入和输出)
+        # 或者 inner_dim + in_channels (如果你想 concat 原始输入)
+        # 这里 concat (proj_in后的特征) 和 (transformer后的特征)，因为它们维度一致，语义层级接近
+        self.proj_out = make_conv(inner_dim * 2, out_channels, 1)
+
+
+        # 这里加一个可学习的缩放系数，初始化为很小的值，控制 Transformer 分支的权重
+        # 在训练初期，它会发现 x_feat 这部分的通道更容易降低 Loss（恢复图像轮廓），所以它会赋予 x_feat 更高的权重。
+        # 随着训练进行，Loss 到了瓶颈，单纯靠 x_feat 无法进一步降低 Loss 了（因为需要全局一致性），
+        # 这时候 proj_out 会自动开始增加对 x_trans 部分通道的权重。
+        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.proj_in(x_in, time_emb_in)
+            # 1. 映射到隐空间
+            # x_feat: (B, inner_dim, H, W)
+            x_feat = self.proj_in(x_in, time_emb_in)
 
-            # Input: (B, C, H, W)
-            B, C, H, W = x_in.shape
+            # 2. 准备 Transformer 输入
+            B, C, H, W = x_feat.shape
+            # (B, N, C)
+            x_trans = x_feat.flatten(2).transpose(1, 2)
 
-            # Flatten: (B, C, H, W) -> (B, N, C)
-            x_in = x_in.flatten(2).transpose(1, 2)
-
+            # 3. Transformer 处理
             for layer in self.layers:
-                # 传入 H, W 是为了 RoPE 计算
-                x_in = layer(x_in, time_emb_in)
+                x_trans = layer(x_trans, time_emb_in)
 
-            # Unflatten: (B, N, C) -> (B, C, H, W)
-            x_in = x_in.transpose(1, 2).view(B, C, H, W)
+            # 4. 还原回图像
+            # (B, C, H, W)
+            x_trans = x_trans.transpose(1, 2).view(B, C, H, W)
 
-            x_in = self.proj_out(x_in, time_emb_in)
+            # 5. 【核心策略】：Concat "ShortCut" 和 "Transformer Result"
+            # 这样 Decoder 既能拿到 x_feat (保留了比较好的空间对应关系)
+            # 又能拿到 x_trans (经过全局思考后的特征)
 
-            return x_in
+            # 显式地让 Transformer 分支从 0 开始学：
+            x_trans = x_trans * self.trans_scale
+
+            x_combined = torch.cat([x_feat, x_trans], dim=1)
+
+            # 6. 融合并输出
+            out = self.proj_out(x_combined, time_emb_in)
+
+            return out
 
         if self.training:
             return checkpoint(main_path, x, time_emb, use_reentrant=False)
