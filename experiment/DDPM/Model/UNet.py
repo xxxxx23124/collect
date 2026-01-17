@@ -160,14 +160,12 @@ class ResMLPBlock(nn.Module):
     带残差连接的 MLP Block，允许网络做得更深而不梯度消失
     """
     def __init__(self,
-                 dim,
-                 dropout=0.1):
+                 dim,):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
-            nn.Dropout(dropout)
         )
         self.act = nn.SiLU()
 
@@ -1285,7 +1283,7 @@ class BottleneckTransformerStage(nn.Module):
         # 在训练初期，它会发现 x_feat 这部分的通道更容易降低 Loss（恢复图像轮廓），所以它会赋予 x_feat 更高的权重。
         # 随着训练进行，Loss 到了瓶颈，单纯靠 x_feat 无法进一步降低 Loss 了（因为需要全局一致性），
         # 这时候 proj_out 会自动开始增加对 x_trans 部分通道的权重。
-        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
+        self.trans_scale = nn.Parameter(torch.tensor(1e-4), requires_grad=True)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):

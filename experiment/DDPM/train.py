@@ -25,7 +25,7 @@ def run_training(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     # 3. 优化器和调度器
-    optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=0)
 
     # 余弦退火调度器，T_max 设为总步数或 Epoch 数
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
