@@ -395,7 +395,10 @@ class TimeAwareCondConv2d(nn.Module):
         # [B, num_experts]
         """
         # 这个部分过去是为了图像检测任务设计，在DDPM中，可能加噪声不合适。
-        # 大概就是我发现模型loss卡在 0.025左右下不去了，我感觉这个数量级和 1e-2（噪声强度）相关，所以估计这个是噪声问题。
+        # 大概就是我发现模型loss卡在 0.025左右下不去了（我没有继续训练，可能这个不是下限）
+        # 怎么说呢，加了噪声后，模型的输出变成了 N(mu，sigma_{noise}^2)，对于MSE的期望 即:
+        # E((hat{y} - y_{true})^2) = (mu - y_{true})^2 + sigma_{noise}^2
+        # 这里的这个sigma_{noise}^2是模型永远无法消除的。所以loss会遇到一个无法突破的瓶颈。
         if self.training:
             gating_logits = self.router(pooled, time_emb)
             # Add noise during training to encourage expert diversity
