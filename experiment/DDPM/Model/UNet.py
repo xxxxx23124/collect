@@ -1035,12 +1035,19 @@ class Stem(nn.Module):
 class TimeAwareToRGB(nn.Module):
     """
     将特征映射回图像空间 (RGB或噪声)。
-    通常结构: Norm -> SiLU -> Conv
-    bias=True:
-        没有 Bias，模型必须强行通过调整 Conv 的权重来拟合这个均值偏移。
-        bias=True 允许每个 Expert 不仅学习特征的模式（Pattern/Texture），还能学习特征的基准偏移（Offset/Brightness）。
-        即使gamma 很小，模型仍然保留了通过 Bias 调整局部均值的潜力（虽然一开始也被压制了，
-        但随着 gamma 变大，Bias 能立即发挥作用，而不需要重新通过调整巨大的 Kernel 权重来模拟偏移）。
+    结构: Norm -> Conv
+    bias=False:
+        bias 开启带来的收益与其面临的风险，不值当。
+        DDPM 的每一步逆向操作，本质上都在“放大”信号。inv_sqrt_alpha 这是恒大于 1的。
+        假设在 Epoch A，模型的最后一层 Bias 稍微偏大了一点点（比如 +0.005）
+        模型倾向于预测“更正”的噪声，导致减去噪声后的 x_(t-1) 整体数值偏大。
+        这个微小的偏差被 inv_sqrt_alpha 放大。
+        经过 1000 步的累积，+0.005 的偏差可能变成了 +5.0 的偏差。
+        最终图像数值全部 > 1，显示为全白。
+        振荡：到了下一个 Epoch，Loss 发现预测结果太大了，于是疯狂惩罚参数，导致参数矫枉过正，Bias 变成了 -0.005。
+        于是下一个 Epoch 采样出来就是全黑。
+
+    关于在Conv前加一个激活函数？这个会改变数据的分布与均值，Act -> Norm -> Conv 也许可以，但为了简单，这里不使用激活函数。
     """
 
     def __init__(self,
@@ -1060,7 +1067,7 @@ class TimeAwareToRGB(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -1068,13 +1075,11 @@ class TimeAwareToRGB(nn.Module):
 
         # 使用 AdaCLN 做最后的归一化，确保去噪结束时的分布也受时间控制
         self.norm = AdaCLN(in_channels, time_emb_dim)
-        self.act = nn.GELU()
         self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
             x_in = self.norm(x_in, time_emb_in)
-            x_in = self.act(x_in)
             return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
