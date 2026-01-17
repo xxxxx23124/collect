@@ -946,8 +946,7 @@ class TimeAwareSelfAttention(nn.Module):
                 # 输出形状保持不变
                 q, k = self.rope(q, k)
 
-            # 3. Flash Attention (核心加速步骤)
-            # PyTorch 会自动处理 Mask (这里没有 mask) 和 Scale
+            # 3. Flash Attention
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
