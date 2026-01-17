@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
         # 还原到 [0, 1] 用于保存查看
         save_img = (img + 1) / 2
-        save_image(save_img, "../test_cat_sample.png")
+        save_image(save_img, "../test_ImageNet_sample.png")
         print("✅ Sample image saved to 'test_cat_sample.png'")
     else:
         print("❌ No images found. Please check your paths.")
