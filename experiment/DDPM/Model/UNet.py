@@ -395,6 +395,7 @@ class TimeAwareCondConv2d(nn.Module):
         # [B, num_experts]
         """
         # 这个部分过去是为了图像检测任务设计，在DDPM中，可能加噪声不合适。
+        # 大概就是我发现模型loss卡在 0.025左右下不去了，我感觉这个数量级和 1e-2（噪声强度）相关，所以估计这个是噪声问题。
         if self.training:
             gating_logits = self.router(pooled, time_emb)
             # Add noise during training to encourage expert diversity
@@ -403,6 +404,7 @@ class TimeAwareCondConv2d(nn.Module):
         else:
             routing_weights = torch.sigmoid(self.router(pooled, time_emb))
         """
+        # 不添加任何人为噪音可能是适合DDPM的
         routing_weights = torch.sigmoid(self.router(pooled, time_emb))
         # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
         # weight_eff: [B, out, in//g, k, k]
