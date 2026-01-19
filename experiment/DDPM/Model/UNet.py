@@ -730,50 +730,6 @@ class DualPathStage(nn.Module):
             return main_path(x, time_emb)
 
 
-
-class FeatureFusionBlock(nn.Module):
-    """
-    专门用于 Decoder 阶段 skip connection 拼接后的特征融合与降维。
-    结构: AdaCLN -> GELU -> 1x1 TimeAwareCondConv
-    """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 time_emb_dim,
-                 use_condconv=True,
-                 num_experts=4):
-        super().__init__()
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.act = nn.GELU()
-        self.norm = AdaCLN(in_channels, time_emb_dim)
-        # 1x1 卷积用于降维，不改变空间尺寸
-        self.conv = make_conv(in_channels, out_channels, 1,1,0,1)
-
-    def forward(self, x, time_emb):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.norm(x_in, time_emb_in)
-            x_in = self.act(x_in)
-            return self.conv(x_in, time_emb_in)
-
-        return main_path(x, time_emb)
-
-
 class DownsampleLayer(nn.Module):
     """
     DownsampleLayer for DPN: Downsamples feature maps and adjusts channel dimensions.
@@ -889,7 +845,7 @@ class UpsampleLayer(nn.Module):
 class PixelShuffleUpsampleLayer(nn.Module):
     """
     追求质量的 PixelShuffle 上采样层。
-    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> Act
+    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> (concat -> AdaCLN -> Act)
 
     以下是对这个模块中的一些超参数设置的解释：
         TimeAwareCondConv2d 的 bias=False：
@@ -898,10 +854,9 @@ class PixelShuffleUpsampleLayer(nn.Module):
             如果 b_0 很亮，而 b_1 很暗。
             那么无论输入图像是什么，输出图像的所有2x2像素块里，左上角永远比右上角亮。
             这相当于在整张图上叠加了一层永久去不掉的网格纹理。
-        为什么要加激活函数呢？
-            不加 Act 的含义：这层仅仅是在做“调整分辨率”这件事，不负责非线性的特征变换。
-            加 Act呢，这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
-            同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
+
+    为什么这里面没有激活函数呢？因为PixelShuffleUpsampleLayer的下一个模块就是FeatureFusionBlock，
+    在FeatureFusionBlock是有激活函数的。
     """
 
     def __init__(self,
@@ -945,9 +900,6 @@ class PixelShuffleUpsampleLayer(nn.Module):
         self.conv = make_conv(in_channels, inner_out, k=3, s=1, p=1, g=groups)
 
         self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
-
-        # 这里的激活函数放在 PixelShuffle 之后
-        self.act = nn.GELU()
 
         # ICNR 初始化
         # 这是一个非常关键的步骤，防止 PixelShuffle 初始化时的棋盘格效应
@@ -995,9 +947,54 @@ class PixelShuffleUpsampleLayer(nn.Module):
             x_in = self.conv(x_in, time_emb_in)
             # 再 Shuffle 变大尺寸
             x_in = self.pixel_shuffle(x_in)
-            # 最后激活
-            x_in = self.act(x_in)
             return x_in
+
+        return main_path(x, time_emb)
+
+
+class FeatureFusionBlock(nn.Module):
+    """
+    专门用于 Decoder 阶段 skip connection 拼接后的特征融合与降维。
+    结构: AdaCLN -> GELU -> 1x1 TimeAwareCondConv
+
+    为什么要加激活函数呢？
+    这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
+    同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 time_emb_dim,
+                 use_condconv=True,
+                 num_experts=4):
+        super().__init__()
+        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        self.act = nn.GELU()
+        self.norm = AdaCLN(in_channels, time_emb_dim)
+        # 1x1 卷积用于降维，不改变空间尺寸
+        self.conv = make_conv(in_channels, out_channels, 1,1,0,1)
+
+    def forward(self, x, time_emb):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+            x_in = self.norm(x_in, time_emb_in)
+            x_in = self.act(x_in)
+            return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
 
