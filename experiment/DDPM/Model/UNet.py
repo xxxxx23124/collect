@@ -393,6 +393,7 @@ class TimeAwareCondConv2d(nn.Module):
 
         # Calculate routing weights based on Content + Time
         # [B, num_experts]
+
         """
         # 这个部分过去是为了图像检测任务设计，在DDPM中，可能加噪声不合适。
         # 大概就是我发现模型loss卡在 0.025左右下不去了（我没有继续训练，可能这个不是下限）
@@ -407,8 +408,28 @@ class TimeAwareCondConv2d(nn.Module):
         else:
             routing_weights = torch.sigmoid(self.router(pooled, time_emb))
         """
-        # 不添加任何人为噪音可能是适合DDPM的
-        routing_weights = torch.sigmoid(self.router(pooled, time_emb))
+
+        """
+        1. 关于噪声：不添加任何人为噪音可能是适合DDPM的。
+
+        2. 关于Softmax vs Sigmoid：
+           用softmax可能更适合DDPM。原本的sigmoid激活在图像分类/检测任务中可能影响不大
+           （例如当出现某种模式时，就是那个类别，检测任务中的定位的精确度也不像DDPM这么严格），
+           但在DDPM这一类要求精确的回归任务中，如果方差不可控，模型可能会消耗很多精力去适应sigmoid组合专家带来的统计分布变化。
+           这会导致严重的“内耗”。
+
+        3. 关于正则化：
+           目前决定不启用正则化强制让专家负载均衡。
+           原因：卷积核不像大语言模型中的专家（MLP），卷积核的参数容量很小，主要是做模式匹配。
+           一个核如果被迫去学多种模式，必然导致精度下降。
+           在DDPM中，初期步（构图）和后期步（去噪）的任务差距很大，不同的卷积核天然倾向于负责不同阶段的任务。
+           如果在某些时刻路由学会了组合专家（例如 0.5*A + 0.5*B），那是为了增强表达能力。
+           如果强行加正则，强制保证每一个卷积核的利用率，反而会破坏这种自然的分工，造成模型性能下降。
+        """
+
+        # 使用 Softmax 保证权重之和为 1，维持特征图的方差稳定性
+        routing_weights = F.softmax(self.router(pooled, time_emb), dim=1)
+
         # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
         # weight_eff: [B, out, in//g, k, k]
         weight_eff = (routing_weights[:, :, None, None, None, None] * self.weight[None]).sum(1)
@@ -1429,7 +1450,8 @@ class BottleneckTransformerStage(nn.Module):
 
             # 4. 还原回图像
             # (B, C, H, W)
-            x_trans = x_trans.transpose(1, 2).view(B, C, H, W)
+            # 直接用 reshape (reshape会自动处理连续性)
+            x_trans = x_trans.transpose(1, 2).reshape(B, C, H, W)
 
             # 5. 【核心策略】：Concat "ShortCut" 和 "Transformer Result"
             # 这样 Decoder 既能拿到 x_feat (保留了比较好的空间对应关系)
@@ -1463,20 +1485,20 @@ class DiffusionUNet_64(nn.Module):
 
         # ================= ENCODER =================
         # Enc1: 64ch
-        self.enc1 = DualPathStage(64, 64, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        # Down1: 96 -> 128
-        self.down1 = DownsampleLayer(96, 128, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.enc1 = DualPathStage(64, 64, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        # Down1: 112 -> 128
+        self.down1 = DownsampleLayer(112, 128, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Enc2: 128ch
-        self.enc2 = DualPathStage(128, 128, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        # Down2: 160 -> 256
-        self.down2 = DownsampleLayer(160, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.enc2 = DualPathStage(128, 128, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        # Down2: 176 -> 256
+        self.down2 = DownsampleLayer(176, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Enc3: 256ch
-        self.enc3 = DualPathStage(256, 256, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        self.att3 = TimeAwareSelfAttention(288, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
-        # Down3: 288 -> 512
-        self.down3 = DownsampleLayer(288, 512, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.enc3 = DualPathStage(256, 256, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.att3 = TimeAwareSelfAttention(304, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
+        # Down3: 304 -> 512
+        self.down3 = DownsampleLayer(304, 512, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # ================= BOTTLENECK =================
         self.bot_stage = BottleneckTransformerStage(512, 512, 1024, num_layers=8,
@@ -1488,38 +1510,38 @@ class DiffusionUNet_64(nn.Module):
         # Bot Out (512) -> Up (256)
         self.up1 = PixelShuffleUpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Concat: Up1(256) + Enc3_Skip(288) = 544
-        # Fusion: 544 -> 384
-        self.fuse1 = FeatureFusionBlock(544, 384, time_emb_dim)
+        # Concat: Up1(256) + Enc3_Skip(304) = 560
+        # Fusion: 560 -> 384
+        self.fuse1 = FeatureFusionBlock(560, 384, time_emb_dim)
 
         # Stage: 处理 384 通道
-        self.dec1 = DualPathStage(384, 384, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        self.dec1_att = TimeAwareSelfAttention(416, time_emb_dim, resolution=16, num_heads=6)  # 384 + 2*16 = 416
+        self.dec1 = DualPathStage(384, 384, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.dec1_att = TimeAwareSelfAttention(432, time_emb_dim, resolution=16, num_heads=6)  # 384 + 2*16 = 416
 
         # --- Up 2 (16x16 -> 32x32) ---
-        # Dec1 Out (416) -> Up (256)
-        self.up2 = PixelShuffleUpsampleLayer(416, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        # Dec1 Out (432) -> Up (192)
+        self.up2 = PixelShuffleUpsampleLayer(432, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Concat: Up2(192) + Enc2_Skip(160) = 352
-        # Fusion: 352 -> 192
-        self.fuse2 = FeatureFusionBlock(352, 192, time_emb_dim)
+        # Concat: Up2(192) + Enc2_Skip(176) = 368
+        # Fusion: 368 -> 192
+        self.fuse2 = FeatureFusionBlock(368, 192, time_emb_dim)
 
-        self.dec2 = DualPathStage(192, 192, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        # Dec2 Out: 192 + 32 = 224
+        self.dec2 = DualPathStage(192, 192, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        # Dec2 Out: 240
 
         # --- Up 3 (32x32 -> 64x64) ---
-        # Dec2 Out (224) -> Up (128)
-        self.up3 = PixelShuffleUpsampleLayer(224, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        # Dec2 Out (240) -> Up (96)
+        self.up3 = PixelShuffleUpsampleLayer(240, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
-        # Concat: Up3(96) + Enc1_Skip(96) = 192
-        # Fusion: 192 -> 96
-        self.fuse3 = FeatureFusionBlock(192, 96, time_emb_dim)
+        # Concat: Up3(96) + Enc1_Skip(112) = 208
+        # Fusion: 208 -> 96
+        self.fuse3 = FeatureFusionBlock(208, 96, time_emb_dim)
 
-        self.dec3 = DualPathStage(96, 96, num_blocks=2, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        # Dec3 Out: 96 + 32 = 128
+        self.dec3 = DualPathStage(96, 96, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        # Dec3 Out: 144
 
         # ================= OUTPUT =================
-        self.final = TimeAwareToRGB(128, time_emb_dim, 3)
+        self.final = TimeAwareToRGB(144, time_emb_dim, 3)
 
     def forward(self, x, time):
         t_emb = self.time_mlp(time)
