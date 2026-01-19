@@ -326,7 +326,7 @@ class TimeAwareCondConv2d(nn.Module):
                  stride: int = 1,
                  padding: int = 0,
                  groups: int = 1,
-                 bias: bool = True,
+                 bias: bool = False,
                  num_experts: int = 4,
                  gating_noise_std: float = 1e-2,):
         super(TimeAwareCondConv2d, self).__init__()
@@ -474,8 +474,9 @@ class AdaCLN(nn.Module):
 
 
 class AttentiveAdaGRN(nn.Module):
-    def __init__(self, channels, time_emb_dim):
+    def __init__(self, channels, time_emb_dim, eps=1e-6):
         super().__init__()
+        self.eps = eps
         # 这一部分用来生成 gamma 和 beta
         # 输入不仅仅是 time，而是 time 和 pooled_x 的交互
         self.time_proj = nn.Linear(time_emb_dim, channels)
@@ -488,7 +489,7 @@ class AttentiveAdaGRN(nn.Module):
         # x: (B, C, H, W)
         # 1. 标准 GRN 计算 (归一化部分)
         gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
 
         # 2. 生成动态参数 (Attention 思想)
         x_pooled = x.mean(dim=(2, 3))  # (B, C)
@@ -566,7 +567,7 @@ class DualPathBlock(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -578,6 +579,7 @@ class DualPathBlock(nn.Module):
         self.ln = AdaCLN(res_channels, time_emb_dim)
 
         mid_channels = res_channels * expansion_ratio
+        # 必须关闭bias（这里bias是默认关闭的），因为bias会影响接下来的GRN工作
         self.conv3_up = make_conv(res_channels, mid_channels, 1)
 
         # LayerScale 参数
@@ -712,8 +714,6 @@ class FeatureFusionBlock(nn.Module):
     """
     专门用于 Decoder 阶段 skip connection 拼接后的特征融合与降维。
     结构: AdaCLN -> GELU -> 1x1 TimeAwareCondConv
-
-    对于是否使用激活，还需思考
     """
 
     def __init__(self,
@@ -733,7 +733,7 @@ class FeatureFusionBlock(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -766,9 +766,6 @@ class DownsampleLayer(nn.Module):
         groups: number of groups for grouped convolution.
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
-
-    建议开启 Bias，因为尺寸改变时基准值可能会变
-
     """
     def __init__(self,
                  in_channels: int,
@@ -797,7 +794,7 @@ class DownsampleLayer(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -821,12 +818,10 @@ class DownsampleLayer(nn.Module):
         return main_path(x, time_emb)
 
 
+"""
 class UpsampleLayer(nn.Module):
-    """
+
     上采样层：Nearest Interpolation + (TimeAwareCondConv or TimeAwareConv)
-    Bias 允许模型学习一个独立于输入的“基础底色”或“亮度偏移”。
-    这里的是否使用激活，还需要思考
-    """
 
     def __init__(self,
                  in_channels: int,
@@ -847,7 +842,7 @@ class UpsampleLayer(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -864,6 +859,123 @@ class UpsampleLayer(nn.Module):
             x_in = self.act(x_in)
             x_in = self.upsample(x_in)
             x_in = self.conv(x_in, time_emb_in)
+            return x_in
+
+        return main_path(x, time_emb)
+"""
+
+
+class PixelShuffleUpsampleLayer(nn.Module):
+    """
+    追求质量的 PixelShuffle 上采样层。
+    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> Act
+
+    以下是对这个模块中的一些超参数设置的解释：
+        TimeAwareCondConv2d 的 bias=False：
+            卷积层的 Bias 是加在通道上的。
+            假设输出通道是 4 个，Bias向量为[b_0, b_1, b_2, b_3]
+            如果 b_0 很亮，而 b_1 很暗。
+            那么无论输入图像是什么，输出图像的所有2x2像素块里，左上角永远比右上角亮。
+            这相当于在整张图上叠加了一层永久去不掉的网格纹理。
+        为什么要加激活函数呢？
+            不加 Act 的含义：这层仅仅是在做“调整分辨率”这件事，不负责非线性的特征变换。
+            加 Act呢，这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
+            同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 dense_inc: int,
+                 time_emb_dim: int,
+                 groups: int = 1,
+                 use_condconv: bool = True,
+                 num_experts: int = 4):
+        super().__init__()
+
+        # 目标输出通道数
+        target_out = out_channels + dense_inc
+        # PixelShuffle 需要 r^2 倍的通道数，这里 scale=2，所以是 4 倍
+        expansion = 4
+
+        # 内部卷积输出通道数
+        inner_out = target_out * expansion
+
+        # 辅助函数：创建卷积
+        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
+            if use_condconv:
+                return TimeAwareCondConv2d(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    time_emb_dim=time_emb_dim,
+                    kernel_size=k,
+                    stride=s,
+                    padding=p,
+                    groups=g,
+                    bias=False,
+                    num_experts=num_experts
+                )
+            else:
+                raise TypeError("This feature is not yet implemented.")
+
+        self.ln = AdaCLN(in_channels, time_emb_dim)
+
+        # 这里我们使用 3x3 卷积来生成扩展通道，增加感受野
+        self.conv = make_conv(in_channels, inner_out, k=3, s=1, p=1, g=groups)
+
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
+
+        # 这里的激活函数放在 PixelShuffle 之后
+        self.act = nn.GELU()
+
+        # ICNR 初始化
+        # 这是一个非常关键的步骤，防止 PixelShuffle 初始化时的棋盘格效应
+        if use_condconv:
+            # 对于 CondConv，我们对每个 expert 进行 ICNR 初始化
+            for i in range(num_experts):
+                self._icnr_init(self.conv.weight[i], scale=2)
+        else:
+            raise TypeError("This feature is not yet implemented.")
+
+    def _icnr_init(self, tensor, scale=2):
+        """
+        ICNR initialization
+        核心逻辑：让 PixelShuffle 后的初始效果等同于 Nearest Neighbor 插值。
+        意味着输出的 4 个子像素（对于 scale=2）必须拥有完全相同的权重。
+        """
+        # tensor shape: [out_c, in_c, k, k]
+        # out_c 应该是 new_out_c * (scale ** 2)
+        out_c, in_c, k, k = tensor.shape
+
+        assert out_c % (scale ** 2) == 0, f"out_c % (scale ** 2) should be 0, now is {out_c % (scale ** 2)}"
+
+        new_out_c = out_c // (scale ** 2)
+
+        # 1. 生成小的卷积核
+        # shape: (new_out_c, in_c, k, k)
+        kernel = torch.randn(new_out_c, in_c, k, k) * 0.1
+
+        # 2. 使用 repeat_interleave
+        # PixelShuffle 的通道排列是 [r^2, r^2, ...] 这样的块状
+        # 所以我们需要 [w0, w0, w0, w0, w1, w1, w1, w1, ...]
+        # dim=0 是输出通道维度
+        kernel = kernel.repeat_interleave(scale ** 2, dim=0)
+
+        # 此时 kernel shape 变回了 (out_c, in_c, k, k)
+
+        # 3. 赋值
+        with torch.no_grad():
+            tensor.copy_(kernel)
+
+    def forward(self, x, time_emb):
+        def main_path(x_in, time_emb_in):
+            x_in = self.ln(x_in, time_emb_in)
+            # 先卷积增加通道 (低分辨率)
+            x_in = self.conv(x_in, time_emb_in)
+            # 再 Shuffle 变大尺寸
+            x_in = self.pixel_shuffle(x_in)
+            # 最后激活
+            x_in = self.act(x_in)
             return x_in
 
         return main_path(x, time_emb)
@@ -986,8 +1098,6 @@ class Stem(nn.Module):
         groups: default 1 for classification
         use_condconv: Whether to use CondConv for convolution.
         num_experts: Number of experts for CondConv.
-
-    LayerNorm 只能移除这些 Bias 的平均值，但通道之间 Bias 的相对差异会被保留下来，并影响归一化后的分布形状。
     """
 
     def __init__(self,
@@ -1014,7 +1124,7 @@ class Stem(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=num_experts
                 )
             else:
@@ -1270,7 +1380,7 @@ class BottleneckTransformerStage(nn.Module):
                     stride=s,
                     padding=p,
                     groups=g,
-                    bias=True,
+                    bias=False,
                     num_experts=4
                 )
             else:
@@ -1376,7 +1486,7 @@ class DiffusionUNet_64(nn.Module):
 
         # --- Up 1 (8x8 -> 16x16) ---
         # Bot Out (512) -> Up (256)
-        self.up1 = UpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up1 = PixelShuffleUpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up1(256) + Enc3_Skip(288) = 544
         # Fusion: 544 -> 384
@@ -1388,7 +1498,7 @@ class DiffusionUNet_64(nn.Module):
 
         # --- Up 2 (16x16 -> 32x32) ---
         # Dec1 Out (416) -> Up (256)
-        self.up2 = UpsampleLayer(416, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up2 = PixelShuffleUpsampleLayer(416, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up2(192) + Enc2_Skip(160) = 352
         # Fusion: 352 -> 192
@@ -1399,7 +1509,7 @@ class DiffusionUNet_64(nn.Module):
 
         # --- Up 3 (32x32 -> 64x64) ---
         # Dec2 Out (224) -> Up (128)
-        self.up3 = UpsampleLayer(224, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up3 = PixelShuffleUpsampleLayer(224, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
 
         # Concat: Up3(96) + Enc1_Skip(96) = 192
         # Fusion: 192 -> 96
