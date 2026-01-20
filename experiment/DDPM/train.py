@@ -31,6 +31,7 @@ def run_training(
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     # 4. 训练循环
+    accum_counter = 0
     global_step = 0
 
     print(f"🚀 Start Training on {device}...")
@@ -63,8 +64,11 @@ def run_training(
             loss = loss / accumulation_steps
             loss.backward()
 
+            # 计数器 +1
+            accum_counter += 1
+
             # 只有满足累积步数时才进行更新
-            if (step + 1) % accumulation_steps == 0:
+            if accum_counter % accumulation_steps == 0:
                 # 梯度裁剪 (Max Norm 通常设为 1.0)
                 torch.nn.utils.clip_grad_norm_(ddpm.parameters(), max_norm=1.0)
 
@@ -76,7 +80,7 @@ def run_training(
             loss_val = loss.item() * accumulation_steps
             epoch_loss += loss_val
 
-            progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"})
+            progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}", "global step:": f"{global_step}"})
 
         # 每个 Epoch 结束后调整学习率
         scheduler.step()

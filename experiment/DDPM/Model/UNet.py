@@ -1418,6 +1418,8 @@ class BottleneckTransformerStage(nn.Module):
         ])
 
         # 融合层，加入原因不止是降维，还是Transformer与CNN的语言空间不同
+        self.fusion_norm = AdaCLN(inner_dim * 2, time_emb_dim)
+        self.fusion_act = nn.GELU()
         # 输入维度是 inner_dim * 2 (因为 concat 了 transformer 的输入和输出)
         # 或者 inner_dim + in_channels (如果你想 concat 原始输入)
         # 这里 concat (proj_in后的特征) 和 (transformer后的特征)，因为它们维度一致，语义层级接近
@@ -1457,9 +1459,10 @@ class BottleneckTransformerStage(nn.Module):
             # 显式地让 Transformer 分支从 0 开始学：
             x_trans = x_trans * self.trans_scale
 
-            x_combined = torch.cat([x_feat, x_trans], dim=1)
-
             # 6. 融合并输出
+            x_combined = torch.cat([x_feat, x_trans], dim=1)
+            x_combined = self.fusion_norm(x_combined, time_emb_in)
+            x_combined = self.fusion_act(x_combined)
             out = self.proj_out(x_combined, time_emb_in)
 
             return out
