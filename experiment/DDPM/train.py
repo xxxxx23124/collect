@@ -66,6 +66,8 @@ def run_training(
             # Loss 除以累积步数，因为 backward 会累加梯度
             loss = loss / accumulation_steps
             loss.backward()
+
+            # ================= minibatch梯度合成完整batch梯度 =================
             batch_loss += loss.item()
 
             # 计数器 +1
