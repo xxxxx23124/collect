@@ -8,7 +8,7 @@ from experiment.DDPM.Model.UNet import DiffusionUNet_64
 
 if __name__ == "__main__":
     # 1. 实例化数据集
-    dataset = CatDataset()
+    dataset = ImagenetDataset()
 
     # 2. 只有当找到图片时才开始训练
     if len(dataset) > 0:

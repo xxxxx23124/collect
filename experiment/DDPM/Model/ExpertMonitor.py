@@ -38,6 +38,9 @@ class ExpertMonitor:
 
         def hook(module, input, output):
             # output: (MiniBatch, num_experts) -> Logits
+            # 如果模型不在训练模式，直接无视
+            if not module.training:
+                return
             with torch.no_grad():
                 probs = F.softmax(output, dim=1)
                 # 计算当前 Mini-Batch 的平均使用率

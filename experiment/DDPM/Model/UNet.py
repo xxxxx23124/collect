@@ -280,6 +280,12 @@ class TimeAttentionRouter(nn.Module):
         # 5. 最终分类器
         self.classifier = nn.Linear(self.hidden_dim, num_experts)
 
+        # 专门针对 classifier 的初始化
+        # 权重设为极小的高斯分布，偏置设为0
+        # 这样初始的 logits 几乎全为0，Softmax后概率非常均匀
+        nn.init.normal_(self.classifier.weight, std=0.01)
+        nn.init.zeros_(self.classifier.bias)
+
     def forward(self, x_pooled, time_emb):
         """
         x_pooled: (B, C) - 全局平均池化后的特征
