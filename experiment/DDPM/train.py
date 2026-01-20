@@ -4,7 +4,8 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from tqdm import tqdm
 
-from DDPM import DDPM
+from experiment.DDPM.DDPM import DDPM
+from experiment.DDPM.Model.ExpertMonitor import ExpertMonitor
 
 
 def run_training(
@@ -30,6 +31,7 @@ def run_training(
     # 余弦退火调度器，T_max 设为总步数或 Epoch 数
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
+    monitor = ExpertMonitor(unet, log_dir=r"runs/ddpm_experiment")
     # 4. 训练循环
     accum_counter = 0
     global_step = 0
@@ -76,12 +78,22 @@ def run_training(
                 optimizer.zero_grad()
                 global_step += 1
 
+                # 每 10 个 global_step 记录一次，避免日志文件太大
+                if global_step % 10 == 0:
+                    monitor.log_step(global_step)
+                    # 顺便记录一下 Loss 和 LR
+                    monitor.writer.add_scalar("Train/Loss", loss.item() * accumulation_steps, global_step)
+                    monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
+
             # 还原 Loss 数值用于打印
             loss_val = loss.item() * accumulation_steps
             epoch_loss += loss_val
 
             progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}", "global step:": f"{global_step}"})
 
+        # 如果你真的忍不住想看一眼控制台，就在每个 Epoch 结束时打印一次快照
+        # 使用 progress_bar.write 或者 monitor 自带的方法
+        # monitor.print_summary_to_console(tqdm_bar=progress_bar)
         # 每个 Epoch 结束后调整学习率
         scheduler.step()
         avg_loss = epoch_loss / len(dataloader)
@@ -98,4 +110,5 @@ def run_training(
         save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
         print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
 
+    monitor.close()
     print("✅ Training Finished!")
