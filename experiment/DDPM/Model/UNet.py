@@ -985,8 +985,8 @@ class FeatureFusionBlock(nn.Module):
             else:
                 raise TypeError("This feature is not yet implemented.")
 
-        self.act = nn.GELU()
         self.norm = AdaCLN(in_channels, time_emb_dim)
+        self.act = nn.GELU()
         # 1x1 卷积用于降维，不改变空间尺寸
         self.conv = make_conv(in_channels, out_channels, 1,1,0,1)
 
