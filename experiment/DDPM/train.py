@@ -33,6 +33,7 @@ def run_training(
 
     monitor = ExpertMonitor(unet, log_dir=r"runs/ddpm_experiment")
     # 4. 训练循环
+    batch_loss = 0
     accum_counter = 0
     global_step = 0
 
@@ -65,6 +66,7 @@ def run_training(
             # Loss 除以累积步数，因为 backward 会累加梯度
             loss = loss / accumulation_steps
             loss.backward()
+            batch_loss += loss.item()
 
             # 计数器 +1
             accum_counter += 1
@@ -78,12 +80,15 @@ def run_training(
                 optimizer.zero_grad()
                 global_step += 1
 
-                # 每 10 个 global_step 记录一次，避免日志文件太大
-                if global_step % 10 == 0:
-                    monitor.log_step(global_step)
-                    # 顺便记录一下 Loss 和 LR
-                    monitor.writer.add_scalar("Train/Loss", loss.item() * accumulation_steps, global_step)
-                    monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
+                # 此时 monitor.batch_buffer 里已经攒了 N 个 mini-batch 的数据
+                # 调用 log_and_reset 进行结算、记录并清空
+                monitor.log_and_reset(global_step)
+
+                # 顺便记录一下 Loss 和 LR
+                monitor.writer.add_scalar("Train/Loss", batch_loss, global_step)
+                monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
+
+                batch_loss = 0
 
             # 还原 Loss 数值用于打印
             loss_val = loss.item() * accumulation_steps
@@ -91,9 +96,6 @@ def run_training(
 
             progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}", "global step:": f"{global_step}"})
 
-        # 如果你真的忍不住想看一眼控制台，就在每个 Epoch 结束时打印一次快照
-        # 使用 progress_bar.write 或者 monitor 自带的方法
-        # monitor.print_summary_to_console(tqdm_bar=progress_bar)
         # 每个 Epoch 结束后调整学习率
         scheduler.step()
         avg_loss = epoch_loss / len(dataloader)

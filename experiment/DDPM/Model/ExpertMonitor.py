@@ -8,16 +8,16 @@ from experiment.DDPM.Model.UNet import TimeAwareCondConv2d
 class ExpertMonitor:
     def __init__(self, model, log_dir="runs/ddpm_experts"):
         self.hooks = []
-        self.expert_stats = defaultdict(list)
+        # 用 list 来存储多次 forward 的结果
+        self.batch_buffer = defaultdict(list)
         self.layer_names = []
-        # 初始化 TensorBoard Writer
         self.writer = SummaryWriter(log_dir)
         self._register_hooks(model)
-        print(f"👀 监控器已启动！日志将保存到: {log_dir}")
+        print(f"👀 累积式监控器已启动！日志将保存到: {log_dir}")
 
     def _register_hooks(self, model):
         """
-        自动遍历模型，找到所有的 TimeAwareCondConv2d，并狠狠地挂上钩子。
+        自动遍历模型，找到所有的 TimeAwareCondConv2d。
         """
         # 遍历所有模块，寻找目标层
         for name, module in model.named_modules():
@@ -37,52 +37,43 @@ class ExpertMonitor:
         """
 
         def hook(module, input, output):
-            # output: (B, num_experts) -> Logits
+            # output: (MiniBatch, num_experts) -> Logits
             with torch.no_grad():
-                # 计算 Softmax 得到概率
                 probs = F.softmax(output, dim=1)
-                # 计算当前 Batch 的平均使用率
+                # 计算当前 Mini-Batch 的平均使用率
+                # 这里得到 [num_experts] 的向量
                 avg_usage = probs.mean(dim=0).detach().cpu()
-                self.expert_stats[layer_name] = avg_usage
+
+                # Append 到缓存列表中
+                self.batch_buffer[layer_name].append(avg_usage)
 
         return hook
 
-    def log_step(self, global_step):
+    def log_and_reset(self, global_step):
         """
-        将当前这一步的数据写入 TensorBoard
+        这个函数要在 optimizer.step() 之后调用。
+        它会结算过去几次 forward 的总账，写入 TensorBoard，然后清空缓存。
         """
-        for layer_name, usage in self.expert_stats.items():
-            # usage 是一个向量，例如 [0.25, 0.25, 0.25, 0.25]
-            # 我们把它拆开记录，这样你可以看到每个专家的曲线
+        for layer_name, usage_list in self.batch_buffer.items():
+            if not usage_list:
+                continue
 
-            # 记录每个专家的曲线
-            for i, u in enumerate(usage):
+            # usage_list 是一个列表，里面有 accumulation_steps 个 tensor
+            # 比如 10 个 [4] 的 tensor
+            # 我们将它们 stack 起来变成 [10, 4]，然后对 dim=0 求平均
+            # 这样得到的就是整个 Effective Batch 的平均专家使用率
+            accumulated_usage = torch.stack(usage_list).mean(dim=0)
+
+            # 1. 记录每个专家的曲线
+            for i, u in enumerate(accumulated_usage):
                 self.writer.add_scalar(f"Expert_Usage/{layer_name}/Exp_{i}", u, global_step)
 
-            # 记录熵 (Entropy)
-            # 熵越高(越接近最大值)，说明负载越均衡；熵越低，说明专家坍塌了
-            # H = -sum(p * log(p))
-            # 加上 1e-9 防止 log(0)
-            entropy = -torch.sum(usage * torch.log(usage + 1e-9))
+            # 2. 记录熵 (反映负载均衡度)
+            entropy = -torch.sum(accumulated_usage * torch.log(accumulated_usage + 1e-9))
             self.writer.add_scalar(f"Expert_Entropy/{layer_name}", entropy, global_step)
 
-    def print_summary_to_console(self, tqdm_bar=None):
-        """
-        如果你非要看控制台，用这个方法。
-        它会使用 tqdm.write 避免打断进度条。
-        """
-        msg = "\n📊 [Expert Monitor Snapshot]\n"
-        for name in self.layer_names:
-            if name in self.expert_stats:
-                u = self.expert_stats[name]
-                # 格式化一下，比如 [0.25, 0.25, 0.25, 0.25]
-                u_str = " | ".join([f"{x:.2f}" for x in u])
-                msg += f"  {name[-20:]:<20}: [{u_str}]\n"
-
-        if tqdm_bar:
-            tqdm_bar.write(msg)
-        else:
-            print(msg)
+        # 【关键】清空缓存，迎接下一个 Accumulation Cycle
+        self.batch_buffer.clear()
 
     def close(self):
         for h in self.hooks:
