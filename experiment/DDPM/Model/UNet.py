@@ -95,16 +95,17 @@ class RoPE2D(nn.Module):
         # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
         emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
 
-        # 5. 拼接 -> (H, W, dim)
-        emb_full = torch.cat([emb_y_grid, emb_x_grid], dim=-1)
-
-        # 拉平为序列形式 -> (H*W, dim)
-        freqs = emb_full.reshape(-1, dim)
+        # 5. 拉平为序列形式 -> (H*W, dim/2)
+        freqs_y_full = emb_y_grid.reshape(-1, half_dim)
+        freqs_x_full = emb_x_grid.reshape(-1, half_dim)
 
         # 6. 预计算并注册 cos/sin 缓存
         # shape: (1, 1, H*W, dim) 方便广播
-        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("cos_y_cached", freqs_y_full.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_y_cached", freqs_y_full.sin().unsqueeze(0).unsqueeze(0))
+        # shape: (1, 1, H*W, dim) 方便广播
+        self.register_buffer("cos_x_cached", freqs_x_full.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_x_cached", freqs_x_full.sin().unsqueeze(0).unsqueeze(0))
 
     def forward(
             self,
@@ -126,27 +127,31 @@ class RoPE2D(nn.Module):
         if seq_len is None:
             seq_len = q.shape[2]
 
-        # 获取对应长度的 cos/sin
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
+        def main_path(x_in: torch.Tensor):
+            # 拆分 Y 部分和 X 部分
+            # x: (B, H, N, D) -> y_part: (B, H, N, D/2), x_part: (B, H, N, D/2)
+            y_part, x_part = x_in.chunk(2, dim=-1)
 
-        q_embed = self.apply_rotary_pos_emb(q, cos, sin)
-        k_embed = self.apply_rotary_pos_emb(k, cos, sin)
+            # 获取 Y 部分对应长度的 cos/sin
+            cos_y = self.cos_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+            sin_y = self.sin_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+
+            # 获取 X 部分对应长度的 cos/sin
+            cos_x = self.cos_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+            sin_x = self.sin_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+
+            # 分别应用 1D RoPE
+            y_out = y_part * cos_y + self.rotate_half(y_part) * sin_y
+            x_out = x_part * cos_x + self.rotate_half(x_part) * sin_x
+
+            # 拼回去
+            return torch.cat((y_out, x_out), dim=-1)
+
+
+        q_embed = main_path(q)
+        k_embed = main_path(k)
 
         return q_embed, k_embed
-
-    def apply_rotary_pos_emb(
-            self,
-            x: torch.Tensor,
-            cos: torch.Tensor,
-            sin: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        应用旋转位置编码
-        x: (B, H, SeqLen, Dim)
-        cos, sin: (1, 1, SeqLen, Dim)
-        """
-        return (x * cos) + (self.rotate_half(x) * sin)
 
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """将张量的后半部分旋转到前面，并取负"""
@@ -434,6 +439,11 @@ class TimeAwareCondConv2d(nn.Module):
            在DDPM中，初期步（构图）和后期步（去噪）的任务差距很大，不同的卷积核天然倾向于负责不同阶段的任务。
            如果在某些时刻路由学会了组合专家（例如 0.5*A + 0.5*B），那是为了增强表达能力。
            如果强行加正则，强制保证每一个卷积核的利用率，反而会破坏这种自然的分工，造成模型性能下降。
+           
+        4. 实际测试 4专家：
+            在简单数据集，如64像素猫头，会出现专家死亡
+            在复杂数据集，如64像素ImageNet，没有出现专家死亡，
+            但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
         """
 
         # 使用 Softmax 保证权重之和为 1，维持特征图的方差稳定性
