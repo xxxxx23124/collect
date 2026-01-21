@@ -549,7 +549,8 @@ class AttentiveAdaGRN(nn.Module):
         beta = beta.unsqueeze(-1).unsqueeze(-1)
 
         # 3. 应用
-        return gamma * (x * nx) + beta + x
+        # return gamma * (x * nx) + beta + x
+        return x * (1 + gamma * nx) + beta
 
 class DualPathBlock(nn.Module):
     """
@@ -1437,8 +1438,15 @@ class BottleneckTransformerStage(nn.Module):
         ])
 
         # 融合层，加入原因不止是降维，还是Transformer与CNN的语言空间不同
-        self.fusion_norm = AdaCLN(inner_dim * 2, time_emb_dim)
         self.fusion_act = nn.GELU()
+        # GRN鼓励通道间的竞争，即让transformer和proj_in竞争
+        """
+        GRN补充[来自ConvNeXt V2]：
+            GRN（Global Response Normalization）被提出的核心目的，
+            是为了解决通道间的特征坍塌（Feature Collapse）问题，
+            从而增加通道间信息的多样性，避免冗余（即大量通道失活或表现一致）
+        """
+        self.fusion_grn = AttentiveAdaGRN(inner_dim * 2, time_emb_dim)
         # 输入维度是 inner_dim * 2 (因为 concat 了 transformer 的输入和输出)
         # 或者 inner_dim + in_channels (如果你想 concat 原始输入)
         # 这里 concat (proj_in后的特征) 和 (transformer后的特征)，因为它们维度一致，语义层级接近
@@ -1446,10 +1454,11 @@ class BottleneckTransformerStage(nn.Module):
 
 
         # 这里加一个可学习的缩放系数，初始化为很小的值，控制 Transformer 分支的权重
-        # 在训练初期，它会发现 x_feat 这部分的通道更容易降低 Loss（恢复图像轮廓），所以它会赋予 x_feat 更高的权重。
-        # 随着训练进行，Loss 到了瓶颈，单纯靠 x_feat 无法进一步降低 Loss 了（因为需要全局一致性），
-        # 这时候 proj_out 会自动开始增加对 x_trans 部分通道的权重。
-        self.trans_scale = nn.Parameter(torch.tensor(1e-4), requires_grad=True)
+        # 因为GRN的存在，transformer最开始是被压制的，因为trans_scale让transformer闭嘴了
+        # 当transformer开始说话时，就是模型需要的信息，而不是那些显而易见的信息
+        # 这个时候，原始的通道的连接提供了修复/还原被transformer损失的信息
+        # 这时，这个transformer应该就可以比较好地融入这个CNN架构（因为transformer的工作方式天生和CNN不同，同一个dim内的语义是不同的）
+        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
@@ -1480,8 +1489,8 @@ class BottleneckTransformerStage(nn.Module):
 
             # 6. 融合并输出
             x_combined = torch.cat([x_feat, x_trans], dim=1)
-            x_combined = self.fusion_norm(x_combined, time_emb_in)
             x_combined = self.fusion_act(x_combined)
+            x_combined = self.fusion_grn(x_combined, time_emb_in)
             out = self.proj_out(x_combined, time_emb_in)
 
             return out
@@ -1492,7 +1501,7 @@ class BottleneckTransformerStage(nn.Module):
             return main_path(x, time_emb)
 
 
-class DiffusionUNet_64(nn.Module):
+class DiffusionTransUNet_64(nn.Module):
     def __init__(self, in_channels=3, time_emb_dim=256):
         super().__init__()
         self.time_emb_dim = time_emb_dim
@@ -1609,7 +1618,7 @@ if __name__ == "__main__":
     print(f"Testing on {device}")
 
     # 1. 实例化模型
-    model = DiffusionUNet_64().to(device)
+    model = DiffusionTransUNet_64().to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())

@@ -5,7 +5,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from experiment.DDPM.DDPM import DDPM
-from experiment.DDPM.Model.ExpertMonitor import ExpertMonitor
+from experiment.DDPM.Tools.ExpertMonitor import ExpertMonitor
 
 
 def run_training(
