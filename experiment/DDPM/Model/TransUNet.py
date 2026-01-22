@@ -6,22 +6,78 @@ import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
 
-"""
-# SinusoidalPositionalEmbeddings暂时不启用，因为有GaussianFourierProjection了
-class SinusoidalPositionalEmbeddings(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
+class Factory:
+    """
+    统一管理 CondConv 和普通 Conv 的生成。
+    统一管理 Transformer组件的生成。
+    """
+    def __init__(self, time_emb_dim, num_experts=4, attn_head_dim=64):
+        self.time_emb_dim = time_emb_dim
+        self.num_experts = num_experts
+        # 旋转编码是公共的，实现在Factory中
+        # 使用RoPE2D的默认配置，attn_head_dim为64就是默认配置
+        self.attn_head_dim = attn_head_dim
+        self.rope = RoPE2D(dim=self.attn_head_dim)
+        self.get_conv_error = """
+        作者是懒鬼，现在还没实现这个，如果要实现，作者会参考style_gan 2中权重调制，但需要注意，权重调制的成果会被CLN消除.
+        权重调制，在作者眼中的为了放缩不同通道的重要性（不调制均值），与GRN很搭配（GRN看通道的能量，与均值有关），
+        但CLN也是重新调制不同通道的重要性，但会重新归一化均值与方差，然后再次放缩，这会导致权重调制多余,
+        因此这里还需要实现一个普通卷积。
+        """
 
-    def forward(self, time):
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-"""
+    def get_condconv(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False):
+        return TimeAwareCondConv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            time_emb_dim=self.time_emb_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=bias,
+            num_experts=self.num_experts
+        )
+    def get_normconv(self,):
+        raise NotImplementedError(self.get_conv_error)
+
+    def get_convmod(self, ):
+        raise NotImplementedError(self.get_conv_error)
+
+    def get_act(self):
+        # 卷积通路统一使用SiLU
+        return nn.SiLU()
+
+    def get_cln(self, channels):
+        return AdaCLN(
+            channels=channels,
+            time_emb_dim=self.time_emb_dim
+        )
+
+    def get_grn(self, channels):
+        return AttentiveAdaGRN(
+            channels=channels,
+            time_emb_dim=self.time_emb_dim
+        )
+
+    def get_rms(self, channels):
+        return AdaRMSNorm(
+            channels=channels,
+            time_emb_dim=self.time_emb_dim
+        )
+
+    def get_attn(self, channels, num_heads):
+        return FlashAttentionCore(
+            channels=channels,
+            num_heads=num_heads,
+            rope=self.rope
+        )
+
+    def get_swiglu(self, channels, inner_channels):
+        return TimeAwareSwiGLU(
+            channels=channels,
+            inner_channels=inner_channels,
+            time_emb_dim=self.time_emb_dim
+        )
 
 
 class GaussianFourierProjection(nn.Module):
@@ -37,127 +93,10 @@ class GaussianFourierProjection(nn.Module):
         # 注册为 buffer
         self.register_buffer("W", W)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B,) -> time steps
         x_proj = x[:, None] * self.W[None, :] * 2 * torch.pi
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-
-
-class RoPE2D(nn.Module):
-    """
-    2D 旋转位置编码 (Rotary Position Embedding)
-    将 head_dim 的前半部分用于编码 Y(高度) 位置，后半部分用于编码 X(宽度) 位置。
-
-    Args:
-        dim: head dimension，必须是偶数
-        height: 图像/特征图的高度（patch 数量）
-        width: 图像/特征图的宽度（patch 数量）
-        base: RoPE 的基础频率 这里我们选用100，因为处理的范围是在8-16，然后在注意力计算中，这个是cos（竖直对）+ cos（水平对）的累加和，
-        类似曼哈顿距离，这种情况下，100 Max Wavelength大约628 像素，既没有混叠（远大于16），又有足够的区分度。
-    """
-
-    def __init__(
-            self,
-            dim: int,
-            height: int,
-            width: int,
-            base: float = 100.0
-    ):
-        super().__init__()
-
-        assert dim % 4 == 0, f"dim must be 4*n, got 4*{dim // 4}+{dim % 4}"
-
-        self.dim = dim
-        self.height = height
-        self.width = width
-        self.base = base
-
-        half_dim = dim // 2  # 每个轴分配的维度
-        quarter_dim = half_dim // 2  # 用于生成频率的维度
-
-        # 1. 生成逆频率
-        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
-
-        # 2. 生成 Height (Y) 的位置编码
-        t_y = torch.arange(height, dtype=torch.float)
-        freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)  # (H, quarter_dim)
-        emb_y = torch.cat((freqs_y, freqs_y), dim=-1)  # (H, half_dim)
-
-        # 3. 生成 Width (X) 的位置编码
-        t_x = torch.arange(width, dtype=torch.float)
-        freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)  # (W, quarter_dim)
-        emb_x = torch.cat((freqs_x, freqs_x), dim=-1)  # (W, half_dim)
-
-        # 4. 广播构建全图 Grid
-        # Y轴编码: (H, 1, half_dim) -> (H, W, half_dim)
-        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
-
-        # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
-        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
-
-        # 5. 拉平为序列形式 -> (H*W, dim/2)
-        freqs_y_full = emb_y_grid.reshape(-1, half_dim)
-        freqs_x_full = emb_x_grid.reshape(-1, half_dim)
-
-        # 6. 预计算并注册 cos/sin 缓存
-        # shape: (1, 1, H*W, dim) 方便广播
-        self.register_buffer("cos_y_cached", freqs_y_full.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_y_cached", freqs_y_full.sin().unsqueeze(0).unsqueeze(0))
-        # shape: (1, 1, H*W, dim) 方便广播
-        self.register_buffer("cos_x_cached", freqs_x_full.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_x_cached", freqs_x_full.sin().unsqueeze(0).unsqueeze(0))
-
-    def forward(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            seq_len: int = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        对 query 和 key 应用 2D 旋转位置编码
-
-        Args:
-            q: Query tensor, shape (B, num_heads, SeqLen, head_dim)
-            k: Key tensor, shape (B, num_heads, SeqLen, head_dim)
-            seq_len: 可选，实际序列长度（用于处理变长序列）
-
-        Returns:
-            tuple: 应用位置编码后的 (q, k)
-        """
-        if seq_len is None:
-            seq_len = q.shape[2]
-
-        def main_path(x_in: torch.Tensor):
-            # 拆分 Y 部分和 X 部分
-            # x: (B, H, N, D) -> y_part: (B, H, N, D/2), x_part: (B, H, N, D/2)
-            y_part, x_part = x_in.chunk(2, dim=-1)
-
-            # 获取 Y 部分对应长度的 cos/sin
-            cos_y = self.cos_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-            sin_y = self.sin_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-
-            # 获取 X 部分对应长度的 cos/sin
-            cos_x = self.cos_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-            sin_x = self.sin_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-
-            # 分别应用 1D RoPE
-            y_out = y_part * cos_y + self.rotate_half(y_part) * sin_y
-            x_out = x_part * cos_x + self.rotate_half(x_part) * sin_x
-
-            # 拼回去
-            return torch.cat((y_out, x_out), dim=-1)
-
-
-        q_embed = main_path(q)
-        k_embed = main_path(k)
-
-        return q_embed, k_embed
-
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """将张量的后半部分旋转到前面，并取负"""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
 
 
 class ResMLPBlock(nn.Module):
@@ -174,7 +113,7 @@ class ResMLPBlock(nn.Module):
         )
         self.act = nn.SiLU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(x + self.net(x))
 
 
@@ -208,7 +147,7 @@ class TimeMLP(nn.Module):
         # 4. 输出层 (Hidden -> Time Emb Dim)
         self.out_proj = nn.Linear(hidden_dim, time_emb_dim)
 
-    def forward(self, time):
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
         """
         time: (B,) 输入的时间步索引或归一化时间
         """
@@ -228,51 +167,23 @@ class TimeMLP(nn.Module):
         # 4. 调整维度输出
         return self.out_proj(x)
 
-class TimeModulator(nn.Module):
-    """
-    用于 AdaCLN 和 AdaGRN 的时间映射模块
-    结构: Linear -> SiLU -> Linear
-    """
 
-    def __init__(self, time_emb_dim, out_channels, init_value=0.0):
-        super().__init__()
-        self.out_channels = out_channels
-        self.init_value = init_value
-
-        self.net = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, out_channels)
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        # 1. 最后一层的权重 weight 初始化为 0
-        # 这样 t (时间) 的变化在初始阶段不会造成剧烈的特征波动
-        nn.init.zeros_(self.net[-1].weight)
-
-        # 2. 最后一层的偏置 bias 进行特殊初始化
-        nn.init.constant_(self.net[-1].bias, self.init_value)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TimeAttentionRouter(nn.Module):
-    def __init__(self, in_channels, time_emb_dim, num_experts=4, hidden_dim=64):
+class CondConvRouter(nn.Module):
+    def __init__(self, channels, time_emb_dim, num_experts=4, hidden_dim=64):
         super().__init__()
 
+        # hidden_dim = 64 这里的考量是，这个小模块的任务不是很复杂，最终输出也就是4个专家的各种组合，维度为64应该很足够了
+        # 但这个是一个经验主义的判断，主要是想着大了浪费参数
         self.hidden_dim = hidden_dim
 
         # 1. Q 映射 (Time) -> 压缩到 hidden_dim
         self.to_q = nn.Linear(time_emb_dim, self.hidden_dim)
 
         # 2. K 映射 (Content) -> 压缩到 hidden_dim
-        self.to_k = nn.Linear(in_channels, self.hidden_dim)
+        self.to_k = nn.Linear(channels, self.hidden_dim)
 
         # 3. V 映射 (Content) -> 压缩到 hidden_dim
-        self.to_v = nn.Linear(in_channels, self.hidden_dim)
+        self.to_v = nn.Linear(channels, self.hidden_dim)
 
         # 4. 通道混合矩阵 (Latent Mixer)
         # 在 64 维的隐空间里做交互，参数量(64*64*2)
@@ -283,15 +194,19 @@ class TimeAttentionRouter(nn.Module):
         )
 
         # 5. 最终分类器
-        self.classifier = nn.Linear(self.hidden_dim, num_experts)
+        # 这里我们关闭bias，因为我们不希望Router对专家有偏见，即对选择专家没有倾向
+        self.classifier = nn.Linear(self.hidden_dim, num_experts, bias=False)
 
+        # 6. 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
         # 专门针对 classifier 的初始化
         # 权重设为极小的高斯分布，偏置设为0
         # 这样初始的 logits 几乎全为0，Softmax后概率非常均匀
         nn.init.normal_(self.classifier.weight, std=0.01)
-        nn.init.zeros_(self.classifier.bias)
 
-    def forward(self, x_pooled, time_emb):
+    def forward(self, x_pooled: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         x_pooled: (B, C) - 全局平均池化后的特征
         time_emb: (B, T_dim)
@@ -340,14 +255,15 @@ class TimeAwareCondConv2d(nn.Module):
                  bias: bool = False,
                  num_experts: int = 4,
                  gating_noise_std: float = 1e-2,):
-        super(TimeAwareCondConv2d, self).__init__()
+        super().__init__()
+
         assert in_channels % groups == 0, "in_channels must be divisible by groups."
         assert out_channels % groups == 0, "out_channels must be divisible by groups."
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.time_emb_dim = time_emb_dim
-        self.kernel_size = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
+        self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
         self.groups = groups
@@ -365,7 +281,7 @@ class TimeAwareCondConv2d(nn.Module):
             self.register_parameter('bias', None)
 
         # Routing network: MLP taking both (AvgPooled Input + Time Embedding)
-        self.router = TimeAttentionRouter(in_channels, time_emb_dim, num_experts)
+        self.router = CondConvRouter(in_channels, time_emb_dim, num_experts)
 
         self._init_weights()
 
@@ -389,23 +305,14 @@ class TimeAwareCondConv2d(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, x, time_emb) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x (Tensor): Input feature map [B, C, H, W].
             time_emb (Tensor): Time embedding vector [B, D] indicating noise level.
         Returns:
             Tensor: Output feature map computed with time-adaptive kernels.
-        """
-        B, C, H, W = x.shape
 
-        # Compute per-input routing weights using global context
-        pooled = F.avg_pool2d(x, (H, W)).view(B, C)  # [B, in_channels]
-
-        # Calculate routing weights based on Content + Time
-        # [B, num_experts]
-
-        """
         # 这个部分过去是为了图像检测任务设计，在DDPM中，可能加噪声不合适。
         # 大概就是我发现模型loss卡在 0.025左右下不去了（我没有继续训练，可能这个不是下限）
         # 怎么说呢，加了噪声后，模型的输出变成了 N(mu，sigma_{noise}^2)，对于MSE的期望 即:
@@ -418,9 +325,8 @@ class TimeAwareCondConv2d(nn.Module):
             routing_weights = torch.sigmoid(gating_logits + noise)
         else:
             routing_weights = torch.sigmoid(self.router(pooled, time_emb))
-        """
 
-        """
+        关于添加噪声：
         1. 关于噪声：不添加任何人为噪音可能是适合DDPM的。
 
         2. 关于Softmax vs Sigmoid：
@@ -446,36 +352,82 @@ class TimeAwareCondConv2d(nn.Module):
             但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
         """
 
+        B, C, H, W = x.shape
+
+        # Compute per-input routing weights using global context
+        pooled = F.avg_pool2d(x, (H, W)).view(B, C)  # [B, in_channels]
+
+        # Calculate routing weights based on Content + Time
         # 使用 Softmax 保证权重之和为 1，维持特征图的方差稳定性
-        routing_weights = F.softmax(self.router(pooled, time_emb), dim=1)
+        routing_weights = F.softmax(self.router(pooled, time_emb), dim=1) # [B, num_experts]
 
         # Compute effective weights by aggregating experts: Sum(weight_i * routing_i)
-        # weight_eff: [B, out, in//g, k, k]
-        weight_eff = (routing_weights[:, :, None, None, None, None] * self.weight[None]).sum(1)
+        weight_eff = (routing_weights.view(B, self.num_experts, 1, 1, 1, 1) *
+                      self.weight.unsqueeze(0)).sum(1)  # [B, out, in/g, k, k]
 
         # Compute effective bias if present
         if self.bias is not None:
-            bias_eff = (routing_weights[:, :, None] * self.bias[None]).sum(1)  # [B, out]
+            bias_eff = (routing_weights.view(B, self.num_experts, 1) *
+                        self.bias.unsqueeze(0)).sum(1)  # [B, out]
+            bias_eff = bias_eff.view(-1)  # Flatten to [B * out] for conv2d
         else:
             bias_eff = None
 
         # Flatten batch and channels for grouped convolution trick
         x_flat = x.view(1, B * C, H, W)  # [1, B*in, H, W]
-        weight_flat = weight_eff.view(B * self.out_channels, self.in_channels // self.groups, self.kernel_size,
+        # Flatten weights: [B * out, in/g, k, k]
+        weight_flat = weight_eff.view(B * self.out_channels,
+                                      self.in_channels // self.groups,
+                                      self.kernel_size,
                                       self.kernel_size)
-        groups = B * self.groups
+        # Calculate groups for the single large convolution
+        total_groups = B * self.groups
 
         # Apply convolution with unique kernel per sample
         out_flat = F.conv2d(
-            x_flat, weight_flat, None, self.stride, self.padding, dilation=1, groups=groups
+            x_flat,
+            weight_flat,
+            bias_eff,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=1,
+            groups=total_groups
         )  # [1, B*out, H', W']
-
-        # Add bias if present
-        if bias_eff is not None:
-            out_flat = out_flat + bias_eff.view(1, B * self.out_channels, 1, 1)
 
         # Reshape back to standard batch format [B, out, H', W']
         return out_flat.view(B, self.out_channels, out_flat.shape[2], out_flat.shape[3])
+
+
+class TimeModulator(nn.Module):
+    """
+    用于 AdaCLN 和 AdaGRN 的时间映射模块
+    结构: Linear -> SiLU -> Linear
+    训练初期，这个模块将输出0，恒等映射。
+    """
+
+    def __init__(self, time_emb_dim, out_channels):
+        super().__init__()
+        self.out_channels = out_channels
+
+        # 这个模块，如果我们宏观来看，第一层线性映射与来自TimeMLP的输出间是没有任何激活函数的
+        # 将这个模块设计得稍微复杂是因为我们希望分治，每个子模块都要完成自己的任务，需要自己思考，而不是让TimeMLP指导全部
+        # 关于bias的思考是，关闭bias，因为目前用到这个模块的地方，都是希望模块输出为0的恒等映射，没有需要bias指定某个值的情况，
+        # 另外就是我们不希望没有时间输入的情况下，bias依然在影响模型工作。
+        self.net = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels, bias=False)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # 最后一层的权重 weight 初始化为 0
+        # 这样 t (时间) 的变化在初始阶段不会造成剧烈的特征波动
+        nn.init.zeros_(self.net[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class AdaCLN(nn.Module):
@@ -484,15 +436,15 @@ class AdaCLN(nn.Module):
     Replaces static weight/bias with time-dependent modulation.
     """
 
-    def __init__(self, num_channels, time_emb_dim, eps=1e-6):
+    def __init__(self, channels, time_emb_dim, eps=1e-6):
         super().__init__()
-        self.num_channels = num_channels
+        self.num_channels = channels
         self.eps = eps
 
         # 将时间嵌入映射为 Scale (gamma) 和 Shift (beta)
-        self.emb_layers = TimeModulator(time_emb_dim, 2 * num_channels, 0)
+        self.emb_layers = TimeModulator(time_emb_dim, 2 * channels)
 
-    def forward(self, x, time_emb):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         x: (B, C, H, W)
         time_emb: (B, T_dim)
@@ -523,16 +475,17 @@ class AttentiveAdaGRN(nn.Module):
         self.content_proj = nn.Linear(channels, channels)
 
         # 生成 gamma, beta
-        self.to_params = TimeModulator(channels, 2 * channels, 0)
+        self.to_params = TimeModulator(channels, 2 * channels)
 
-    def forward(self, x, time_emb):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
+        B, C, H, W = x.shape
         # 1. 标准 GRN 计算 (归一化部分)
         gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
         nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
 
         # 2. 生成动态参数 (Attention 思想)
-        x_pooled = x.mean(dim=(2, 3))  # (B, C)
+        x_pooled = F.avg_pool2d(x, (H, W)).view(B, C)  # (B, C)
 
         # Q-K 交互：时间 Q 调节 内容 K
         # 这里的交互方式：简单相加或相乘，然后过 MLP
@@ -552,26 +505,273 @@ class AttentiveAdaGRN(nn.Module):
         # return gamma * (x * nx) + beta + x
         return x * (1 + gamma * nx) + beta
 
+
+class AdaRMSNorm(nn.Module):
+    """
+    统一的 AdaRMSNorm，只支持 (B, N, C)
+    """
+    def __init__(self, channels, time_emb_dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dim = channels
+
+        # 只需要调节 scale，不需要 shift (RMSNorm 特性)
+        # TimeModulator初始输出恒定为0
+        # 分batch - 微调
+        self.time_proj = TimeModulator(time_emb_dim, channels)
+
+        # 可学习的基础 scale，类似于 PyTorch RMSNorm 中的 weight
+        # 全局 - 不分batch
+        self.scale = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, N, C)
+        # time_emb: (B, T_dim)
+        """
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor) -> torch.Tensor:
+            # x_in: (B, N, C)
+            # time_emb_in: (B, T_dim)
+
+            # 标准 RMSNorm 计算
+            # x.pow(2).mean(-1) 计算均方值
+            norm_x = x_in * torch.rsqrt(x_in.pow(2).mean(-1, keepdim=True) + self.eps)
+
+            # 应用基础 Scale
+            norm_x = norm_x * self.scale
+
+            # 时间调制
+            # (1 + scale_t) 保证初始状态下是一个 Identity 调制
+            time_scale = self.time_proj(time_emb_in).unsqueeze(1)  # (B, 1, C)
+            out = norm_x * (1 + time_scale)
+
+            return out
+
+        return main_path(x, time_emb)
+
+
+class RoPE2D(nn.Module):
+    """
+    2D 旋转位置编码 (Rotary Position Embedding)
+    将 head_dim 的前半部分用于编码 Y(高度) 位置，后半部分用于编码 X(宽度) 位置。
+
+    Args:
+        dim: head dimension，必须是偶数
+        height: 图像/特征图的高度（patch 数量）
+        width: 图像/特征图的宽度（patch 数量）
+        base: RoPE 的基础频率 这里我们选用1000
+
+    base 为1000的解释：
+                这里我们默认head dim为64为例子，也就是 16对分配给X，16对分配给Y。
+                最低的频率为 1000^(-15/16)，在255像素上，最远距离旋转 255 * 1000^(-15/16) 大约 0.393 rad （不到 1/16 圈）
+                最慢频率很稳，能提供“全局趋势/大尺度”编码；中高频仍然负责细粒度区分。
+    """
+
+    def __init__(
+            self,
+            dim:int=64,
+            height:int=256,
+            width:int=256,
+            base:float=1000.0
+    ):
+        super().__init__()
+
+        assert dim % 4 == 0, f"dim must be 4*n, got 4*{dim // 4}+{dim % 4}"
+
+        self.dim = dim
+        self.height = height
+        self.width = width
+        self.base = base
+
+        half_dim = dim // 2  # 每个轴分配的维度
+        quarter_dim = half_dim // 2  # 用于生成频率的维度
+
+        # 1. 生成逆频率
+        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
+
+        # 2. 生成 Height (Y) 的位置编码
+        t_y = torch.arange(height, dtype=torch.float)
+        freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)  # (H, quarter_dim)
+        emb_y = torch.cat((freqs_y, freqs_y), dim=-1)  # (H, half_dim)
+
+        # 3. 生成 Width (X) 的位置编码
+        t_x = torch.arange(width, dtype=torch.float)
+        freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)  # (W, quarter_dim)
+        emb_x = torch.cat((freqs_x, freqs_x), dim=-1)  # (W, half_dim)
+
+        # 4. 广播构建全图 Grid
+        # Y轴编码: (H, 1, half_dim) -> (H, W, half_dim)
+        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
+
+        # X轴编码: (1, W, half_dim) -> (H, W, half_dim)
+        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
+
+        # 5. 拉平为序列形式 -> (H*W, dim/2)
+        freqs_y_full = emb_y_grid.reshape(-1, half_dim)
+        freqs_x_full = emb_x_grid.reshape(-1, half_dim)
+
+        # 6. 预计算并注册 cos/sin 缓存
+        # shape: (1, 1, H*W, dim) 方便广播
+        self.register_buffer("cos_y_cached", freqs_y_full.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_y_cached", freqs_y_full.sin().unsqueeze(0).unsqueeze(0))
+        # shape: (1, 1, H*W, dim) 方便广播
+        self.register_buffer("cos_x_cached", freqs_x_full.cos().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("sin_x_cached", freqs_x_full.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(self,
+                q: torch.Tensor,
+                k: torch.Tensor,
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        对 query 和 key 应用 2D 旋转位置编码
+
+        Args:
+            q: Query tensor, shape (B, num_heads, SeqLen, head_dim)
+            k: Key tensor, shape (B, num_heads, SeqLen, head_dim)
+
+        Returns:
+            tuple: 应用位置编码后的 (q, k)
+        """
+        seq_len = q.shape[2]
+
+        def main_path(x_in: torch.Tensor):
+            # 拆分 Y 部分和 X 部分
+            # x: (B, H, N, D) -> y_part: (B, H, N, D/2), x_part: (B, H, N, D/2)
+            y_part, x_part = x_in.chunk(2, dim=-1)
+
+            # 获取 Y 部分对应长度的 cos/sin
+            cos_y = self.cos_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+            sin_y = self.sin_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+
+            # 获取 X 部分对应长度的 cos/sin
+            cos_x = self.cos_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+            sin_x = self.sin_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
+
+            # 分别应用 1D RoPE
+            y_out = y_part * cos_y + self.rotate_half(y_part) * sin_y
+            x_out = x_part * cos_x + self.rotate_half(x_part) * sin_x
+
+            # 拼回去
+            return torch.cat((y_out, x_out), dim=-1)
+
+
+        q_embed = main_path(q)
+        k_embed = main_path(k)
+
+        return q_embed, k_embed
+
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """将张量的后半部分旋转到前面，并取负"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+
+class FlashAttentionCore(nn.Module):
+    """
+    核心注意力机制，不关心输入是图片还是序列，只处理 (B, N, C) 格式。
+    默认包含 RoPE 和 Time-Aware QKV 投影。
+    现阶段不支持窗口注意力需要的位置平移。
+    注意：这个模块依赖于RoPE2D中的dim成员变量
+    """
+
+    def __init__(self,
+                 channels:int,
+                 num_heads:int,
+                 rope: RoPE2D):
+        super().__init__()
+        self.num_heads = num_heads
+        # 注意，这里的head_dim来自rope中的dim，
+        # 这样写是为了防止出错，只需要配置多少个头就好
+        head_dim = rope.dim
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        inner_dim = num_heads * head_dim
+
+        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, channels, bias=False)
+
+        self.rope = rope
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, N, C)
+        """
+        B, N, C = x.shape
+
+        def main_path(x_in: torch.Tensor)-> torch.Tensor:
+            qkv = self.to_qkv(x_in)
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            # (B, N, heads, dim) -> (B, heads, N, dim)
+            q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+            # 这里默认应用旋转编码，这里不用担心序列长度的问题，因为在rope会自动检测
+            # 目前默认为 256*256 像素，不超过 256*256 像素都行
+            q, k = self.rope(q, k)
+
+            out = F.scaled_dot_product_attention(q, k, v)
+            out = out.transpose(1, 2).reshape(B, N, -1)
+            return self.to_out(out)
+
+        return main_path(x)
+
+
+class TimeAwareSwiGLU(nn.Module):
+    def __init__(self,
+                 channels: int,
+                 inner_channels: int,
+                 time_emb_dim: int):
+        super().__init__()
+
+        # 内容映射: 产生 Gate 的部分 和 Value 的部分
+        self.w_gate = nn.Linear(channels, inner_channels, bias=False)
+        self.w_val = nn.Linear(channels, inner_channels, bias=False)
+
+        # 时间映射: 产生对 Gate 的控制信号
+        self.w_time = TimeModulator(time_emb_dim, inner_channels)
+
+        # 输出映射
+        self.w_out = nn.Linear(inner_channels, channels, bias=False)
+
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor)-> torch.Tensor:
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
+            """
+            x: (B, N, C)
+            time_emb: (B, T_dim)
+            """
+            # 1. 投影内容
+            c_gate = self.w_gate(x_in)  # (B, N, H)
+            val = self.w_val(x_in)  # (B, N, H)
+
+            # 2. 投影时间
+            # 时间在这里充当一个全局的 Filter，对当前Batch的所有token作用一致
+            t_gate = self.w_time(time_emb_in).unsqueeze(1)  # (B, 1, H)
+
+            # 3. 时间感知门控 (Time-Aware Gating)
+            gate = self.act(c_gate * (1 + t_gate))
+
+            # 4. 应用门控并输出
+            out = self.w_out(gate * val)
+            return out
+
+        return main_path(x, time_emb)
+
+
 class DualPathBlock(nn.Module):
     """
     ConvNeXt-like Dual Path Block: Combines residual and dense connections.
 
     inspired by ConvNeXt V1/V2:
         Larger 7x7 kernel for spatial mixing.
-        Inverted bottleneck MLP in pointwise part (1x1 up -> GELU -> GRN -> 1x1 down).
+        Inverted bottleneck MLP in pointwise part (1x1 up -> SiLU -> GRN -> 1x1 down).
         Minimal Channel-wise LayerNorm.
         GELU activation.
         GRN from ConvNeXt V2 to prevent feature collapse.
-
-    Args:
-        inc: total input channels (res_channels + dense_channels)
-        res_channels: channels for the residual path (fixed per stage)
-        dense_inc: additional channels to add to the dense path
-        time_emb_dim: the dim from time network's output
-        groups: number of groups for grouped convolution
-        use_condconv: whether to use CondConv for convolutions
-        num_experts: number of experts for CondConv
-        expansion_ratio: expansion ratio in ConvNeXt
 
     Reference:
         https://arxiv.org/pdf/1707.01629
@@ -579,49 +779,69 @@ class DualPathBlock(nn.Module):
         https://arxiv.org/pdf/2301.00808
     """
     def __init__(self,
-                 inc: int,
+                 in_channels: int,
                  res_channels: int,
                  dense_inc: int,
-                 time_emb_dim: int,
-                 groups: int=8,
-                 use_condconv: bool=True,
-                 num_experts: int=4,
-                 expansion_ratio: int=4,):
-        super(DualPathBlock, self).__init__()
+                 groups: int,
+                 factory: Factory,
+                 expansion_ratio: int=4, ):
+        super().__init__()
         assert res_channels % groups == 0, f"res_channels:{res_channels} must be divisible by groups:{groups}."
 
-        self.inc = inc
+        # 这个变量在forward中有用
         self.res_channels = res_channels
-        self.dense_inc = dense_inc
-        self.groups = groups
-        self.use_condconv = use_condconv
-        self.num_experts = num_experts
-        self.expansion_ratio = expansion_ratio
 
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
+        # conv1 的作用是对主干的洪流进行降维，1x1卷积，
+        # 这里关于bias的设置，我是认为：可以开，也可以关闭，
+        # 因为后面没有直接连接的cln，bias不会白费，也没有grn。
+        # 但这这里，我选择关闭bias，经验主义，非要接受的话，就是：
+        # 模型通道的底色（bias带来的均值）不是由bias调制的，是由时间向量调制的。
+        self.conv1 = factory.get_condconv(in_channels=in_channels,
+                                          out_channels=res_channels,
+                                          kernel_size=1,
+                                          bias=False)
 
-        self.conv1 = make_conv(inc, res_channels, 1)
+        # 这是7x7卷积，因为后面紧接着cln，bias带来的均值影响被彻底抹除，开启bias就是浪费
+        # 这里补充一个思考 7x7卷积就像是一种窗口注意力，但不是两个像素间的注意力，而是像素（token）与卷积核的注意力（相似度，匹配度）
+        self.conv2 = factory.get_condconv(in_channels=res_channels,
+                                          out_channels=res_channels,
+                                          kernel_size=7,
+                                          padding=3,
+                                          groups=groups,
+                                          bias=False)
 
-        self.conv2 = make_conv(res_channels, res_channels, 7, p=3, g=groups)
-        self.ln = AdaCLN(res_channels, time_emb_dim)
+        # CLN
+        self.cln = factory.get_cln(res_channels)
 
         mid_channels = res_channels * expansion_ratio
         # 必须关闭bias（这里bias是默认关闭的），因为bias会影响接下来的GRN工作
-        self.conv3_up = make_conv(res_channels, mid_channels, 1)
+        # 对于conv3，这里是记忆（KV对）的存储中心的前半段，将7x7的输入，按照自己的知识转换为有用的输出
+        # 在相对简单的任务下，在encoder中，这个模块的压力小，condconv显得杀鸡用牛刀
+        # 这里为了代码简单，统一使用condconv
+        self.conv3_up = factory.get_condconv(in_channels=res_channels,
+                                             out_channels=mid_channels,
+                                             kernel_size=1,
+                                             bias=False)
+
+        self.act = factory.get_act()
+
+        # GRN
+        self.grn = factory.get_grn(mid_channels)
+
+        # 这里是记忆存储中心的后半段
+        # 因为这两个输出之后，可能就是残差或者拼接，加的bias可能在后面模块的cln面前没意义，意义不大
+        # 这个地方需要主意，我没有一次输出res + dense 两部分
+        # 因为res和dense可能负担的任务不同
+        # 因此他们的专家调用情况可能不同，因此这两个模块用有两个路由，而不是共用一个路由
+        # 这两个1x1卷积，在encoder中，同样可以用非condconv替代
+        self.conv3_res = factory.get_condconv(in_channels=mid_channels,
+                                              out_channels=res_channels,
+                                              kernel_size=1,
+                                              bias=False)
+        self.conv3_dense = factory.get_condconv(in_channels=mid_channels,
+                                                out_channels=dense_inc,
+                                                kernel_size=1,
+                                                bias=False)
 
         # LayerScale 参数
         # gamma_res 对应 new_res 的通道数 (res_channels)
@@ -633,16 +853,6 @@ class DualPathBlock(nn.Module):
         # 需要比gamma_res大，以防止Dense路径失活
         self.gamma_dense = nn.Parameter(1e-2 * torch.ones(dense_inc), requires_grad=True)
 
-
-        self.gelu = nn.GELU()
-
-        # GRN
-        self.grn = AttentiveAdaGRN(mid_channels, time_emb_dim)
-
-        self.conv3_res = make_conv(mid_channels, res_channels, 1)
-        self.conv3_dense = make_conv(mid_channels, dense_inc, 1)
-
-
     def forward(self, x, time_emb) -> torch.Tensor:
         """
         Args:
@@ -651,12 +861,12 @@ class DualPathBlock(nn.Module):
         Return:
             Tensor
         """
-        def main_path(x_in: torch.Tensor, time_emb: torch.Tensor):
+        def main_path(x_in: torch.Tensor, time_emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             out = self.conv1(x_in, time_emb)
             out = self.conv2(out, time_emb)
-            out = self.ln(out, time_emb)
+            out = self.cln(out, time_emb)
             out = self.conv3_up(out, time_emb)
-            out = self.gelu(out)
+            out = self.act(out)
             out = self.grn(out, time_emb)
             out_res = self.conv3_res(out, time_emb)
             out_dense = self.conv3_dense(out, time_emb)
@@ -682,17 +892,6 @@ class DualPathStage(nn.Module):
     This module sequentially applies a specified number of DualPathBlocks.
     Its primary responsibility is to deepen the network representation at a
     constant spatial resolution.
-
-    Args:
-        in_channels (int): Total input channels (res_channels + initial_dense).
-        res_channels (int): Number of channels for the residual path in this stage.
-        num_blocks (int): Number of DualPathBlocks in this stage.
-        dense_inc (int): Number of dense channels added by each block.
-        groups (int): Number of groups for grouped convolutions.
-        time_emb_dim(int): the dim from time network's output.
-        use_condconv (bool): If True, uses TimeAwareCondConv2d for convolutions.
-        num_experts (int): Number of experts for TimeAwareCondConv2d.
-        expansion_ratio (int): Expansion ratio for the inverted bottleneck.
     """
 
     def __init__(self,
@@ -701,9 +900,7 @@ class DualPathStage(nn.Module):
                  num_blocks: int,
                  dense_inc: int,
                  groups: int,
-                 time_emb_dim: int,
-                 use_condconv: bool = True,
-                 num_experts: int = 4,
+                 factory: Factory,
                  expansion_ratio: int = 4):
         super().__init__()
 
@@ -716,13 +913,11 @@ class DualPathStage(nn.Module):
 
         for _ in range(num_blocks):
             block = DualPathBlock(
-                inc=current_channels,
+                in_channels=current_channels,
                 res_channels=res_channels,
                 dense_inc=dense_inc,
-                time_emb_dim=time_emb_dim,
                 groups=groups,
-                use_condconv=use_condconv,
-                num_experts=num_experts,
+                factory=factory,
                 expansion_ratio=expansion_ratio
             )
             self.blocks.append(block)
@@ -738,7 +933,7 @@ class DualPathStage(nn.Module):
         Return:
             Tensor
         """
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
 
             for block in self.blocks:
                 x_in = block(x_in, time_emb_in)
@@ -754,51 +949,29 @@ class DownsampleLayer(nn.Module):
     """
     DownsampleLayer for DPN: Downsamples feature maps and adjusts channel dimensions.
     ConvNeXt-like: LN + 2x2 strided conv.
-
-    Args:
-        in_channels: Input channels (res_channels + dense_channels).
-        out_channels: Output channels for residual path in next stage.
-        dense_inc: Initial dense channels for next stage.
-        time_emb_dim(int): the dim from time network's output.
-        groups: number of groups for grouped convolution.
-        use_condconv: Whether to use CondConv for convolution.
-        num_experts: Number of experts for CondConv.
     """
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
                  dense_inc: int,
-                 time_emb_dim:int,
-                 groups: int=1,
-                 use_condconv: bool=True,
-                 num_experts:int=4,):
-        super(DownsampleLayer, self).__init__()
-        assert in_channels % groups == 0, f"in_channels:{in_channels} must be divisible by groups:{groups}."
-        assert (out_channels + dense_inc) % groups == 0, f"(out_channels:{out_channels} + dense_inc:{dense_inc}) must be divisible by groups:{groups}."
+                 factory: Factory,):
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.dense_inc = dense_inc
-        self.use_condconv = use_condconv
-        self.num_experts = num_experts
 
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.ln = AdaCLN(in_channels, time_emb_dim)
-        self.conv = make_conv(in_channels, out_channels + dense_inc, 2, s=2, p=0, g=groups)
+        self.cln = factory.get_cln(in_channels)
+        # 这里有一个注意事项是为了追求性能，不能用分组卷积
+        # 这里选择关闭bias，因为后面是残差连接，后面可能连接cln，因此就不开bias了
+        self.conv = factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=out_channels + dense_inc,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            groups=1,
+            bias=False
+        )
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -808,64 +981,17 @@ class DownsampleLayer(nn.Module):
         Return:
             Tensor
         """
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.ln(x_in, time_emb_in)
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
+            x_in = self.cln(x_in, time_emb_in)
             return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
 
 
-"""
-class UpsampleLayer(nn.Module):
-
-    上采样层：Nearest Interpolation + (TimeAwareCondConv or TimeAwareConv)
-
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 dense_inc: int,
-                 time_emb_dim: int,
-                 groups: int=1,
-                 use_condconv: bool=True,
-                 num_experts: int=4):
-        super().__init__()
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.ln = AdaCLN(in_channels, time_emb_dim)
-        self.act = nn.GELU()
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        self.conv = make_conv(in_channels, out_channels + dense_inc, 3,1,1,groups)
-
-    def forward(self, x, time_emb):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.ln(x_in, time_emb_in)
-            x_in = self.act(x_in)
-            x_in = self.upsample(x_in)
-            x_in = self.conv(x_in, time_emb_in)
-            return x_in
-
-        return main_path(x, time_emb)
-"""
-
-
 class PixelShuffleUpsampleLayer(nn.Module):
     """
     追求质量的 PixelShuffle 上采样层。
-    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> (concat -> AdaCLN -> Act)
+    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> (concat -> AdaCLN -> SiLU)
 
     以下是对这个模块中的一些超参数设置的解释：
         TimeAwareCondConv2d 的 bias=False：
@@ -883,10 +1009,7 @@ class PixelShuffleUpsampleLayer(nn.Module):
                  in_channels: int,
                  out_channels: int,
                  dense_inc: int,
-                 time_emb_dim: int,
-                 groups: int = 1,
-                 use_condconv: bool = True,
-                 num_experts: int = 4):
+                 factory: Factory, ):
         super().__init__()
 
         # 目标输出通道数
@@ -897,38 +1020,32 @@ class PixelShuffleUpsampleLayer(nn.Module):
         # 内部卷积输出通道数
         inner_out = target_out * expansion
 
-        # 辅助函数：创建卷积
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.ln = AdaCLN(in_channels, time_emb_dim)
+        self.cln = factory.get_cln(in_channels)
 
         # 这里我们使用 3x3 卷积来生成扩展通道，增加感受野
-        self.conv = make_conv(in_channels, inner_out, k=3, s=1, p=1, g=groups)
+        # 这里关闭bias的原因就是希望放大时不用带偏见
+        self.conv = factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=inner_out,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=1,
+            bias=False
+        )
 
         self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
 
-        # ICNR 初始化
+        self._init_weights()
+
+    def _init_weights(self):
+
+        # 如果是 CondConv，就进行 ICNR 初始化
         # 这是一个非常关键的步骤，防止 PixelShuffle 初始化时的棋盘格效应
-        if use_condconv:
+        if isinstance(self.conv, TimeAwareCondConv2d):
             # 对于 CondConv，我们对每个 expert 进行 ICNR 初始化
-            for i in range(num_experts):
+            for i in range(self.conv.num_experts):
                 self._icnr_init(self.conv.weight[i], scale=2)
-        else:
-            raise TypeError("This feature is not yet implemented.")
 
     def _icnr_init(self, tensor, scale=2):
         """
@@ -960,9 +1077,9 @@ class PixelShuffleUpsampleLayer(nn.Module):
         with torch.no_grad():
             tensor.copy_(kernel)
 
-    def forward(self, x, time_emb):
-        def main_path(x_in, time_emb_in):
-            x_in = self.ln(x_in, time_emb_in)
+    def forward(self, x, time_emb)-> torch.Tensor:
+        def main_path(x_in, time_emb_in)-> torch.Tensor:
+            x_in = self.cln(x_in, time_emb_in)
             # 先卷积增加通道 (低分辨率)
             x_in = self.conv(x_in, time_emb_in)
             # 再 Shuffle 变大尺寸
@@ -975,201 +1092,240 @@ class PixelShuffleUpsampleLayer(nn.Module):
 class FeatureFusionBlock(nn.Module):
     """
     专门用于 Decoder 阶段 skip connection 拼接后的特征融合与降维。
-    结构: AdaCLN -> GELU -> 1x1 TimeAwareCondConv
+    结构: AdaCLN -> SiLU -> 1x1 TimeAwareCondConv
 
     为什么要加激活函数呢？
     这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
     同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
+
+    这个模块是Decoder中的DualPathStage的开始，也就意味着这个模块是残差直连到底的，就不开bias了
     """
 
     def __init__(self,
                  in_channels,
                  out_channels,
-                 time_emb_dim,
-                 use_condconv=True,
-                 num_experts=4):
+                 factory: Factory,):
         super().__init__()
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.norm = AdaCLN(in_channels, time_emb_dim)
-        self.act = nn.GELU()
+        self.cln = factory.get_cln(in_channels)
+        self.act = factory.get_act()
         # 1x1 卷积用于降维，不改变空间尺寸
-        self.conv = make_conv(in_channels, out_channels, 1,1,0,1)
+        # 不要使用分组卷积
+        self.conv = factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            groups=1,
+            bias=False,
+        )
 
-    def forward(self, x, time_emb):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.norm(x_in, time_emb_in)
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor)-> torch.Tensor:
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
+            x_in = self.cln(x_in, time_emb_in)
             x_in = self.act(x_in)
             return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
 
 
-class TimeAwareSelfAttention(nn.Module):
+class SpatialSelfAttention(nn.Module):
     """
-    带 AdaCLN 调制的多头自注意力机制 (MHSA)。
-    对于 256x256 的图像，建议只在低分辨率层 (32x32, 16x16, 8x8) 使用，
-    否则显存会爆炸。
-    使用 PyTorch 2.0+ 的 F.scaled_dot_product_attention 进行加速。
+    作用于CNN的注意力
     """
 
     def __init__(self,
                  channels: int,
-                 time_emb_dim: int,
-                 resolution: tuple | int,
-                 num_heads: int=4,
-                 head_dim: int=64,
-                 use_rope=True):
+                 num_heads: int,
+                 factory: Factory,):
         super().__init__()
         self.num_heads = num_heads
-        inner_dim = num_heads * head_dim
+        self.rms = factory.get_rms(
+            channels=channels,
+        )
+        self.attn = factory.get_attn(
+            channels=channels,
+            num_heads=num_heads,
+        )
 
-        # AdaCLN，这是 TimeAware 的核心
-        self.ln = AdaCLN(channels, time_emb_dim)
-
-        # QKV 生成 (Bias通常设为False以获得纯粹的投影，看个人喜好)
-        self.to_qkv = nn.Linear(channels, inner_dim * 3, bias=False)
-
-        # 输出投影
-        self.to_out = nn.Linear(inner_dim, channels)
-
-        self.use_rope = use_rope
-        if use_rope:
-            if isinstance(resolution, int):
-                self.resolution = (resolution, resolution)
-            else:
-                self.resolution = resolution
-            # 初始化 RoPE
-            # 这里的 dim 必须对应 head_dim，而不是 channels
-            self.rope = RoPE2D(
-                dim=head_dim,
-                height=self.resolution[0],
-                width=self.resolution[1]
-            )
-
-    def forward(self, x, time_emb):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         x: (B, C, H, W)
         time_emb: (B, t_dim)
         """
         B, C, H, W = x.shape
-        N = H * W
-        assert (H, W) == self.resolution, f"Input resolution ({H},{W}) does not match initialized resolution {self.resolution}"
 
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            # 1. AdaCLN Norm & Reshape (Image -> Sequence)
-            # (B, C, H, W) -> (B, N, C)
-            norm_x = self.ln(x_in, time_emb_in)
-            norm_x = norm_x.permute(0, 2, 3, 1).view(B, N, C)
-
-            # 2. 生成 Q, K, V
-            # shape: (B, N, 3 * inner_dim)
-            qkv = self.to_qkv(norm_x)
-
-            # 拆分 Q, K, V
-            # 此时形状: (B, N, num_heads * head_dim)
-            q, k, v = qkv.chunk(3, dim=-1)
-
-            # 变换形状以适配 scaled_dot_product_attention
-            # 需要变换为 (B, Num_Heads, Seq_Len, Head_Dim)
-            q = q.view(B, N, self.num_heads, -1).transpose(1, 2)
-            k = k.view(B, N, self.num_heads, -1).transpose(1, 2)
-            v = v.view(B, N, self.num_heads, -1).transpose(1, 2)
-
-            if self.use_rope:
-                # 应用 RoPE
-                # RoPE 期望输入: (B, H, SeqLen, HeadDim)
-                # 输出形状保持不变
-                q, k = self.rope(q, k)
-
-            # 3. Flash Attention
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False
-            )
-
-            # 4. 还原形状
-            # (B, Num_Heads, N, Head_Dim) -> (B, N, Num_Heads, Head_Dim) -> (B, N, Inner_Dim)
-            # 注意：这里必须用 contiguous()，因为 transpose 改变了内存布局
-            out = out.transpose(1, 2).contiguous().view(B, N, -1)
-
-            # 5. 输出投影
-            out = self.to_out(out)
-
-            # 6. 变回图像空间 (Sequence -> Image)
-            # (B, N, C) -> (B, C, H, W)
-            out = out.view(B, H, W, C).permute(0, 3, 1, 2)
-
-            # Residual connection
-            return x_in + out
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor) -> torch.Tensor:
+            residual = x_in
+            # RMSNorm
+            x_flat = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, C)
+            x_norm = self.rms(x_flat, time_emb_in)
+            # Attention
+            out = self.attn(x_norm)
+            # Reshape back & Residual
+            out = out.transpose(1, 2).reshape(B, C, H, W)
+            return residual + out
 
         return main_path(x, time_emb)
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self,
+                 channels:int,
+                 factory: Factory,
+                 num_heads:int=8,
+                 ffn_mult:float=4.0, ):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Attention Norm
+        self.rms1 = factory.get_rms(channels=channels)
+
+        # Self Attention
+        self.attn = factory.get_attn(channels=channels, num_heads=num_heads)
+
+        # FFN Norm
+        self.rms2 = factory.get_rms(channels=channels)
+
+        # Time-Aware SwiGLU
+        inner_channels = int(channels * ffn_mult)
+        self.ffn = factory.get_swiglu(channels=channels, inner_channels=inner_channels)
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor)-> torch.Tensor:
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
+            # Attention Part
+            x_in = x_in + self.attn(self.rms1(x_in, time_emb_in))
+            # FFN Part
+            x_in = x_in + self.ffn(self.rms2(x_in, time_emb_in), time_emb_in)
+            return x_in
+
+        return main_path(x, time_emb)
+
+
+class BottleneckTransformerStage(nn.Module):
+    def __init__(self,
+                 in_channels:int,
+                 out_channels:int,
+                 inner_channels:int,
+                 num_layers:int,
+                 num_heads:int,
+                 factory: Factory,
+                 ffn_mult:float=4.0,):
+        super().__init__()
+
+        # 这个不要开启bias，即影响下面的RMSNorm，又影响之后的GRN
+        self.proj_in = factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=inner_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=False
+        )
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                channels=inner_channels,
+                factory=factory,
+                num_heads=num_heads,
+                ffn_mult=ffn_mult
+            )
+            for _ in range(num_layers)
+        ])
+
+        # 融合层，加入原因不止是降维，还是Transformer与CNN的语言空间不同
+        self.fusion_act = factory.get_act()
+        # GRN鼓励通道间的竞争，即让transformer和proj_in竞争
+        """
+        GRN补充[来自ConvNeXt V2]：
+            GRN（Global Response Normalization）被提出的核心目的，
+            是为了解决通道间的特征坍塌（Feature Collapse）问题，
+            从而增加通道间信息的多样性，避免冗余（即大量通道失活或表现一致）
+        """
+        self.fusion_grn = factory.get_grn(inner_channels * 2)
+        # 输入维度是 inner_dim * 2 (因为 concat 了 transformer 的输入和输出)
+        # 或者 inner_dim + in_channels (如果你想 concat 原始输入)
+        # 这里 concat (proj_in后的特征) 和 (transformer后的特征)，因为它们维度一致，语义层级接近
+        # 这里的下一个模块应该就是 PixelShuffleUpsampleLayer，立马就会遇到CLN，因此开启bias也没有意义。
+        self.proj_out = factory.get_condconv(
+            in_channels=inner_channels * 2,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=False
+        )
+
+        # 这里加一个可学习的缩放系数，初始化为很小的值，控制 Transformer 分支的权重
+        # 因为GRN的存在，transformer最开始是被压制的，因为trans_scale让transformer闭嘴了
+        # 当transformer开始说话时，就是模型需要的信息，而不是那些显而易见的信息
+        # 这个时候，原始的通道的连接提供了修复/还原被transformer损失的信息
+        # 这时，这个transformer应该就可以比较好地融入这个CNN架构（因为transformer的工作方式天生和CNN不同，同一个dim内的语义是不同的）
+        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor)-> torch.Tensor:
+        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor)-> torch.Tensor:
+            # 1. 映射到隐空间
+            # x_feat: (B, inner_dim, H, W)
+            x_feat = self.proj_in(x_in, time_emb_in)
+
+            # 2. 准备 Transformer 输入
+            B, C, H, W = x_feat.shape
+            # (B, N, C)
+            x_trans = x_feat.flatten(2).transpose(1, 2).contiguous()
+
+            # 3. Transformer 处理
+            for layer in self.layers:
+                x_trans = layer(x_trans, time_emb_in)
+
+            # 4. 还原回图像
+            # (B, C, H, W)
+            # 直接用 reshape (reshape会自动处理连续性)
+            x_trans = x_trans.transpose(1, 2).reshape(B, C, H, W)
+
+            # 5. Concat "ShortCut" 和 "Transformer Result"
+            # 这样 Decoder 既能拿到 x_feat (保留了比较好的空间对应关系)
+            # 又能拿到 x_trans (经过全局思考后的特征)
+
+            # 显式地让 Transformer 分支从 0 开始学：
+            x_trans = x_trans * self.trans_scale
+            x_combined = torch.cat([x_feat, x_trans], dim=1)
+            # 激活筛选过滤信息
+            x_combined = self.fusion_act(x_combined)
+            # GRN鼓励通道间竞争
+            x_combined = self.fusion_grn(x_combined, time_emb_in)
+
+            # 6. 融合并输出
+            out = self.proj_out(x_combined, time_emb_in)
+
+            return out
+
+        if self.training:
+            return checkpoint(main_path, x, time_emb, use_reentrant=False)
+        else:
+            return main_path(x, time_emb)
+
+
 class Stem(nn.Module):
-    """
-    Stem for DPN: ConvNeXt-like: 4x4 strided conv + LN.
-
-    Args:
-        in_channels: Input channels
-        out_channels: Output channels after stem (matches first stage res_channels).
-        time_emb_dim(int): the dim from time network's output.
-        kernel_size: default 4 for classification
-        stride: default 4 for classification
-        padding: default 0 for classification
-        groups: default 1 for classification
-        use_condconv: Whether to use CondConv for convolution.
-        num_experts: Number of experts for CondConv.
-    """
-
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
-                 time_emb_dim: int,
-                 kernel_size: int = 4,
-                 stride: int = 4,
-                 padding:int = 0,
-                 groups: int = 1,
-                 use_condconv: bool = True,
-                 num_experts: int = 4):
+                 factory: Factory,):
 
         super().__init__()
 
-        assert in_channels == 3
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
+        assert in_channels == 3, "in_channels should be 3."
 
-        self.conv = make_conv(in_channels, out_channels, kernel_size, s=stride, p=padding, g=groups)
-        self.ln = AdaCLN(out_channels, time_emb_dim)
+        self.conv = factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=1,
+            bias=False
+        )
+        self.cln = factory.get_cln(channels=out_channels)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -1181,7 +1337,7 @@ class Stem(nn.Module):
         """
         def main_path(x_in, time_emb_in):
             out = self.conv(x_in, time_emb_in)
-            out = self.ln(out, time_emb_in)
+            out = self.cln(out, time_emb_in)
             return out
 
         return main_path(x, time_emb)
@@ -1204,372 +1360,106 @@ class TimeAwareToRGB(nn.Module):
 
     关于在Conv前加一个激活函数？这个会改变数据的分布与均值，Act -> Norm -> Conv 也许可以，但为了简单，这里不使用激活函数。
     """
-
     def __init__(self,
                  in_channels:int,
-                 time_emb_dim:int,
-                 out_channels:int=3,
-                 use_condconv:bool=True,
-                 num_experts: int = 4):
+                 out_channels:int,
+                 factory: Factory,):
         super().__init__()
-        def make_conv(in_c, out_c, k, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=num_experts
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
+        assert out_channels == 3, "out_channels should be 3."
         # 使用 AdaCLN 做最后的归一化，确保去噪结束时的分布也受时间控制
-        self.norm = AdaCLN(in_channels, time_emb_dim)
-        self.conv = make_conv(in_c=in_channels, out_c=out_channels, k=3, s=1, p=1)
+        self.cln = factory.get_cln(channels=in_channels)
+        self.conv =         factory.get_condconv(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=1,
+            bias=False
+        )
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            x_in = self.norm(x_in, time_emb_in)
+            x_in = self.cln(x_in, time_emb_in)
             return self.conv(x_in, time_emb_in)
 
         return main_path(x, time_emb)
 
 
-class AdaRMSNorm(nn.Module):
-    def __init__(self, dim, time_emb_dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dim = dim
-
-        # 只需要调节 scale，不需要 shift (RMSNorm 特性)
-        # 初始化 weights 为 0，确保初始状态近似标准 RMSNorm
-        # 分batch - 微调
-        self.time_proj = TimeModulator(time_emb_dim, dim, 0)
-
-        # 可学习的基础 scale，类似于 PyTorch RMSNorm 中的 weight
-        # 全局 - 不分batch
-        self.scale = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-
-            # x: (B, N, C)
-            # time_emb: (B, T_dim)
-
-            # 1. 标准 RMSNorm 计算
-            # x.pow(2).mean(-1) 计算均方值
-            norm_x = x_in * torch.rsqrt(x_in.pow(2).mean(-1, keepdim=True) + self.eps)
-
-            # 2. 应用基础 Scale
-            norm_x = norm_x * self.scale
-
-            # 3. 时间调制
-            # (1 + scale_t) 保证初始状态下是一个 Identity 调制
-            time_scale = self.time_proj(time_emb_in).unsqueeze(1)  # (B, 1, C)
-            return norm_x * (1 + time_scale)
-
-        return main_path(x, time_emb)
-
-
-class TimeAwareSwiGLU(nn.Module):
-    def __init__(self, dim, hidden_dim, time_emb_dim):
-        super().__init__()
-
-        # 内容映射: 产生 Gate 的部分 和 Value 的部分
-        self.w_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.w_val = nn.Linear(dim, hidden_dim, bias=False)
-
-        # 时间映射: 产生对 Gate 的控制信号
-        self.w_time = TimeModulator(time_emb_dim, hidden_dim, 0)
-
-        # 输出映射
-        self.w_out = nn.Linear(hidden_dim, dim, bias=False)
-
-        self.act = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            """
-            x: (B, N, C)
-            time_emb: (B, T_dim)
-            """
-            # 1. 投影内容
-            c_gate = self.w_gate(x_in)  # (B, N, H)
-            val = self.w_val(x_in)  # (B, N, H)
-
-            # 2. 投影时间
-            # 时间在这里充当一个全局的 Filter，对当前Batch的所有token作用一致
-            t_gate = self.w_time(time_emb_in).unsqueeze(1)  # (B, 1, H)
-
-            # 3. 时间感知门控 (Time-Aware Gating)
-            gate = self.act(c_gate * (1 + t_gate))
-
-            # 4. 应用门控并输出
-            out = self.w_out(gate * val)
-            return out
-
-        return main_path(x, time_emb)
-
-
-class TimeAwareTransformerBlock(nn.Module):
-    def __init__(self,
-                 dim,
-                 time_emb_dim,
-                 resolution: tuple | int,
-                 num_heads=8,
-                 ffn_mult=4,
-                 use_rope=True):
-        super().__init__()
-        self.head_dim = dim // num_heads
-        self.num_heads = num_heads
-        self.use_rope = use_rope
-
-        # Attention Norm
-        self.norm1 = AdaRMSNorm(dim, time_emb_dim)
-
-        # Self Attention
-        self.attn_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.attn_out = nn.Linear(dim, dim, bias=False)
-
-        # FFN Norm
-        self.norm2 = AdaRMSNorm(dim, time_emb_dim)
-
-        # Time-Aware SwiGLU
-        hidden_dim = int(dim * ffn_mult)
-        self.ffn = TimeAwareSwiGLU(dim, hidden_dim, time_emb_dim)
-
-        if use_rope:
-            if isinstance(resolution, int):
-                self.resolution = (resolution, resolution)
-            else:
-                self.resolution = resolution
-
-            # 初始化 RoPE
-            # 这里的 dim 必须对应 head_dim，而不是 channels
-            self.rope = RoPE2D(
-                dim=self.head_dim,
-                height=self.resolution[0],
-                width=self.resolution[1]
-            )
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
-        # x: (B, N, C), N = H*W
-        B, N, C = x.shape
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            # Attention Block
-            residual = x_in
-            x_in = self.norm1(x_in, time_emb_in)
-
-            # QKV
-            qkv = self.attn_qkv(x_in).chunk(3, dim=-1)
-            q, k, v = map(lambda t: t.view(B, N, self.num_heads, self.head_dim).transpose(1, 2), qkv)
-
-            # RoPE Injection
-            if self.use_rope:
-                # RoPE 期望输入: (B, H, SeqLen, HeadDim)
-                q, k = self.rope(q, k)
-
-            # Flash Attention
-            x_in = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False
-            )
-            x_in = x_in.transpose(1, 2).contiguous().view(B, N, C)
-            x_in = self.attn_out(x_in)
-            x_in = residual + x_in
-
-            # Time-Aware FFN Block
-            residual = x_in
-            x_in = self.norm2(x_in, time_emb_in)
-            x_in = self.ffn(x_in, time_emb_in)
-            x_in = residual + x_in
-
-            return x_in
-
-        return main_path(x, time_emb)
-
-
-class BottleneckTransformerStage(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 inner_dim: int,
-                 num_layers: int,
-                 time_emb_dim: int,
-                 resolution: tuple | int,
-                 num_heads: int,
-                 ffn_mult: int=4,
-                 use_condconv:bool=True):
-        super().__init__()
-        def make_conv(in_c, out_c, k=1, s=1, p=0, g=1):
-            if use_condconv:
-                return TimeAwareCondConv2d(
-                    in_channels=in_c,
-                    out_channels=out_c,
-                    time_emb_dim=time_emb_dim,
-                    kernel_size=k,
-                    stride=s,
-                    padding=p,
-                    groups=g,
-                    bias=False,
-                    num_experts=4
-                )
-            else:
-                raise TypeError("This feature is not yet implemented.")
-
-        self.proj_in = make_conv(in_channels, inner_dim, 1)
-
-        self.layers = nn.ModuleList([
-            TimeAwareTransformerBlock(
-                dim=inner_dim,
-                time_emb_dim=time_emb_dim,
-                resolution=resolution,
-                num_heads=num_heads,
-                ffn_mult=ffn_mult
-            )
-            for _ in range(num_layers)
-        ])
-
-        # 融合层，加入原因不止是降维，还是Transformer与CNN的语言空间不同
-        self.fusion_act = nn.GELU()
-        # GRN鼓励通道间的竞争，即让transformer和proj_in竞争
-        """
-        GRN补充[来自ConvNeXt V2]：
-            GRN（Global Response Normalization）被提出的核心目的，
-            是为了解决通道间的特征坍塌（Feature Collapse）问题，
-            从而增加通道间信息的多样性，避免冗余（即大量通道失活或表现一致）
-        """
-        self.fusion_grn = AttentiveAdaGRN(inner_dim * 2, time_emb_dim)
-        # 输入维度是 inner_dim * 2 (因为 concat 了 transformer 的输入和输出)
-        # 或者 inner_dim + in_channels (如果你想 concat 原始输入)
-        # 这里 concat (proj_in后的特征) 和 (transformer后的特征)，因为它们维度一致，语义层级接近
-        self.proj_out = make_conv(inner_dim * 2, out_channels, 1)
-
-
-        # 这里加一个可学习的缩放系数，初始化为很小的值，控制 Transformer 分支的权重
-        # 因为GRN的存在，transformer最开始是被压制的，因为trans_scale让transformer闭嘴了
-        # 当transformer开始说话时，就是模型需要的信息，而不是那些显而易见的信息
-        # 这个时候，原始的通道的连接提供了修复/还原被transformer损失的信息
-        # 这时，这个transformer应该就可以比较好地融入这个CNN架构（因为transformer的工作方式天生和CNN不同，同一个dim内的语义是不同的）
-        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor):
-        def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor):
-            # 1. 映射到隐空间
-            # x_feat: (B, inner_dim, H, W)
-            x_feat = self.proj_in(x_in, time_emb_in)
-
-            # 2. 准备 Transformer 输入
-            B, C, H, W = x_feat.shape
-            # (B, N, C)
-            x_trans = x_feat.flatten(2).transpose(1, 2)
-
-            # 3. Transformer 处理
-            for layer in self.layers:
-                x_trans = layer(x_trans, time_emb_in)
-
-            # 4. 还原回图像
-            # (B, C, H, W)
-            # 直接用 reshape (reshape会自动处理连续性)
-            x_trans = x_trans.transpose(1, 2).reshape(B, C, H, W)
-
-            # 5. 【核心策略】：Concat "ShortCut" 和 "Transformer Result"
-            # 这样 Decoder 既能拿到 x_feat (保留了比较好的空间对应关系)
-            # 又能拿到 x_trans (经过全局思考后的特征)
-
-            # 显式地让 Transformer 分支从 0 开始学：
-            x_trans = x_trans * self.trans_scale
-
-            # 6. 融合并输出
-            x_combined = torch.cat([x_feat, x_trans], dim=1)
-            x_combined = self.fusion_act(x_combined)
-            x_combined = self.fusion_grn(x_combined, time_emb_in)
-            out = self.proj_out(x_combined, time_emb_in)
-
-            return out
-
-        if self.training:
-            return checkpoint(main_path, x, time_emb, use_reentrant=False)
-        else:
-            return main_path(x, time_emb)
-
-
 class DiffusionTransUNet_64(nn.Module):
-    def __init__(self, in_channels=3, time_emb_dim=256):
+    def __init__(self,
+                 in_channels=3,
+                 out_channels=3,
+                 time_emb_dim=256):
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.time_mlp = TimeMLP(time_emb_dim=time_emb_dim, hidden_dim=512)
 
+        # 定义工厂类，注意：旋转编码的实现在factory中
+        factory = Factory(time_emb_dim=time_emb_dim, num_experts=4, attn_head_dim=64)
+
         # Stem
-        self.stem = self.stem = Stem(in_channels, 64, time_emb_dim,
-                 kernel_size=3, stride=1, padding=1, groups=1)
+        self.stem = self.stem = Stem(in_channels=in_channels, out_channels=64, factory=factory)
 
         # ================= ENCODER =================
         # Enc1: 64ch
-        self.enc1 = DualPathStage(64, 64, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.enc1 = DualPathStage(in_channels=64, res_channels=64, num_blocks=3, dense_inc=16, groups=4, factory=factory)
         # Down1: 112 -> 128
-        self.down1 = DownsampleLayer(112, 128, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.down1 = DownsampleLayer(in_channels=112, out_channels=128, dense_inc=0, factory=factory)
 
         # Enc2: 128ch
-        self.enc2 = DualPathStage(128, 128, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.enc2 = DualPathStage(in_channels=128, res_channels=128, num_blocks=3, dense_inc=16, groups=4, factory=factory)
         # Down2: 176 -> 256
-        self.down2 = DownsampleLayer(176, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.down2 = DownsampleLayer(in_channels=176, out_channels=256, dense_inc=1, factory=factory)
 
         # Enc3: 256ch
-        self.enc3 = DualPathStage(256, 256, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        self.att3 = TimeAwareSelfAttention(304, time_emb_dim, resolution=16, num_heads=4)  # 256 + 2*16 = 288
-        # Down3: 304 -> 512
-        self.down3 = DownsampleLayer(304, 512, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.enc3 = DualPathStage(in_channels=257, res_channels=256, num_blocks=3, dense_inc=21, groups=4, factory=factory)
+        self.att3 = SpatialSelfAttention(channels=320, num_heads=5, factory=factory)
+        # Down3: 320 -> 512
+        self.down3 = DownsampleLayer(in_channels=320, out_channels=512, dense_inc=0, factory=factory)
 
         # ================= BOTTLENECK =================
-        self.bot_stage = BottleneckTransformerStage(512, 512, 1024, num_layers=8,
-                                                    time_emb_dim=time_emb_dim, resolution=8, num_heads=16)
+        self.bot_stage = BottleneckTransformerStage(in_channels=512, out_channels=512, inner_channels=1024, num_layers=8,
+                                                    num_heads=16, factory=factory)
 
         # ================= DECODER =================
 
         # --- Up 1 (8x8 -> 16x16) ---
         # Bot Out (512) -> Up (256)
-        self.up1 = PixelShuffleUpsampleLayer(512, 256, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up1 = PixelShuffleUpsampleLayer(in_channels=512, out_channels=256, dense_inc=0, factory=factory)
 
-        # Concat: Up1(256) + Enc3_Skip(304) = 560
-        # Fusion: 560 -> 384
-        self.fuse1 = FeatureFusionBlock(560, 384, time_emb_dim)
+        # Concat: Up1(256) + Enc3_Skip(320) = 576
+        # Fusion: 560 -> 385
+        self.fuse1 = FeatureFusionBlock(in_channels=576, out_channels=385, factory=factory)
 
-        # Stage: 处理 384 通道
-        self.dec1 = DualPathStage(384, 384, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
-        self.dec1_att = TimeAwareSelfAttention(432, time_emb_dim, resolution=16, num_heads=6)  # 384 + 2*16 = 416
+        # Stage: 处理 385 通道
+        self.dec1 = DualPathStage(in_channels=385, res_channels=384, num_blocks=3, dense_inc=21, groups=4, factory=factory)
+        self.dec1_att = SpatialSelfAttention(channels=448, num_heads=7, factory=factory)
 
         # --- Up 2 (16x16 -> 32x32) ---
-        # Dec1 Out (432) -> Up (192)
-        self.up2 = PixelShuffleUpsampleLayer(432, 192, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        # Dec1 Out (448) -> Up (192)
+        self.up2 = PixelShuffleUpsampleLayer(in_channels=448, out_channels=192, dense_inc=0, factory=factory)
 
         # Concat: Up2(192) + Enc2_Skip(176) = 368
         # Fusion: 368 -> 192
-        self.fuse2 = FeatureFusionBlock(368, 192, time_emb_dim)
+        self.fuse2 = FeatureFusionBlock(in_channels=368, out_channels=192, factory=factory)
 
-        self.dec2 = DualPathStage(192, 192, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.dec2 = DualPathStage(in_channels=192, res_channels=192, num_blocks=3, dense_inc=16, groups=4, factory=factory)
         # Dec2 Out: 240
 
         # --- Up 3 (32x32 -> 64x64) ---
         # Dec2 Out (240) -> Up (96)
-        self.up3 = PixelShuffleUpsampleLayer(240, 96, dense_inc=0, time_emb_dim=time_emb_dim, groups=1)
+        self.up3 = PixelShuffleUpsampleLayer(in_channels=240, out_channels=96, dense_inc=0, factory=factory)
 
         # Concat: Up3(96) + Enc1_Skip(112) = 208
         # Fusion: 208 -> 96
-        self.fuse3 = FeatureFusionBlock(208, 96, time_emb_dim)
+        self.fuse3 = FeatureFusionBlock(in_channels=208, out_channels=96, factory=factory)
 
-        self.dec3 = DualPathStage(96, 96, num_blocks=3, dense_inc=16, groups=4, time_emb_dim=time_emb_dim)
+        self.dec3 = DualPathStage(in_channels=96, res_channels=96, num_blocks=3, dense_inc=16, groups=4, factory=factory)
         # Dec3 Out: 144
 
         # ================= OUTPUT =================
-        self.final = TimeAwareToRGB(144, time_emb_dim, 3)
+        self.final = TimeAwareToRGB(in_channels=144, out_channels=out_channels, factory=factory)
 
     def forward(self, x, time):
         t_emb = self.time_mlp(time)
