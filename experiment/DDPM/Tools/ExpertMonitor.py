@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from collections import defaultdict
 from torch.utils.tensorboard import SummaryWriter
 
-from experiment.DDPM.Model.UNet import TimeAwareCondConv2d
+from experiment.DDPM.Model.TransUNet import TimeAwareCondConv2d
 
 class ExpertMonitor:
     def __init__(self, model, log_dir="runs/ddpm_experts"):
