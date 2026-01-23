@@ -9,10 +9,12 @@ class DDPM(nn.Module):
                  model,
                  timesteps=1000,
                  beta_start=1e-4,
-                 beta_end=0.02,):
+                 beta_end=0.02,
+                 use_fixed_small=True,):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
+        self.use_fixed_small = use_fixed_small
 
         # ============================================================
         # 1. 预计算扩散过程所需的常数
@@ -41,8 +43,23 @@ class DDPM(nn.Module):
         self.register_buffer("inv_sqrt_alpha", inv_sqrt_alpha)
         self.register_buffer("denoise_coeff", denoise_coeff)
 
+        # 计算 alpha_hat_prev (即 alpha_hat[t-1])
+        # 对于 t=0, alpha_hat_prev 应为 1.0
+        # 将 alpha_hat 向右移一位，并在第0位填充 1.0
+        alpha_hat_prev = F.pad(alpha_hat[:-1], (1, 0), value=1.0)
+        self.register_buffer("alpha_hat_prev", alpha_hat_prev)
+
+        posterior_variance = beta * (1.0 - alpha_hat_prev) / (1.0 - alpha_hat)
+        # 为了数值稳定性，clamp一下，为了防止数值误差导致出现极小的负数，clamp 最小值为 0
+        self.register_buffer("posterior_variance", posterior_variance.clamp(min=0.0))
+
         # Sigma (方差)
-        self.register_buffer("sigma", torch.sqrt(beta))
+        # Fixed Large
+        # 当 t=0 时，sigma_fl 不为 0。
+        self.register_buffer("sigma_fl", torch.sqrt(beta))
+        # Fixed Small
+        # 当 t=0 时，sigma_fs 为 0。
+        self.register_buffer("sigma_fs", torch.sqrt(posterior_variance.clamp(min=0.0)))
 
     @property
     def device(self):
@@ -128,9 +145,15 @@ class DDPM(nn.Module):
             # 如果不是最后一步 (t > 0)，则添加噪声
             if i > 0:
                 noise = torch.randn_like(x)
-                sigma_t = self.extract(self.sigma, t, x.shape)
+                if self.use_fixed_small:
+                    sigma_t = self.extract(self.sigma_fs, t, x.shape)
+                else:
+                    sigma_t = self.extract(self.sigma_fl, t, x.shape)
                 x = mu + sigma_t * noise
             else:
+                # 最后一步 (t=0 -> x_0) 不加噪声
+                # 理论上 posterior_std[0] 也是 0，所以这里即使加了也没事，
+                # 但为了逻辑清晰，保持这个判断
                 x = mu
 
         self.model.train()

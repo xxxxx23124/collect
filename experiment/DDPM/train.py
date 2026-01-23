@@ -16,7 +16,8 @@ def run_training(
         accumulation_steps=4,  # 累积几步更新一次
         lr=2e-4,
         device="cuda",
-        save_path="ddpm_cat.pth"
+        save_path="ddpm_cat.pth",
+        use_monitor=False,
 ):
     # 1. 初始化模型和 DDPM
     unet = model_cls()
@@ -30,8 +31,8 @@ def run_training(
 
     # 余弦退火调度器，T_max 设为总步数或 Epoch 数
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    monitor = ExpertMonitor(unet, log_dir=r"runs/ddpm_experiment")
+    if use_monitor:
+        monitor = ExpertMonitor(unet, log_dir=r"runs/ddpm_experiment")
     # 4. 训练循环
     batch_loss = 0
     accum_counter = 0
@@ -82,13 +83,14 @@ def run_training(
                 optimizer.zero_grad()
                 global_step += 1
 
-                # 此时 monitor.batch_buffer 里已经攒了 N 个 mini-batch 的数据
-                # 调用 log_and_reset 进行结算、记录并清空
-                monitor.log_and_reset(global_step)
+                if use_monitor:
+                    # 此时 monitor.batch_buffer 里已经攒了 N 个 mini-batch 的数据
+                    # 调用 log_and_reset 进行结算、记录并清空
+                    monitor.log_and_reset(global_step)
 
-                # 顺便记录一下 Loss 和 LR
-                monitor.writer.add_scalar("Train/Loss", batch_loss, global_step)
-                monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
+                    # 顺便记录一下 Loss 和 LR
+                    monitor.writer.add_scalar("Train/Loss", batch_loss, global_step)
+                    monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
 
                 batch_loss = 0
 
@@ -114,5 +116,6 @@ def run_training(
         save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
         print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
 
-    monitor.close()
+    if use_monitor:
+        monitor.close()
     print("✅ Training Finished!")
