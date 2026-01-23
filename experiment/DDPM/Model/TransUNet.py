@@ -65,8 +65,8 @@ class Factory:
             time_emb_dim=self.time_emb_dim
         )
 
-    def get_attn(self, channels, num_heads):
-        return FlashAttentionCore(
+    def get_selfattn(self, channels, num_heads):
+        return SelfAttention(
             channels=channels,
             num_heads=num_heads,
             rope=self.rope
@@ -465,8 +465,9 @@ class TimeAwareCondConv2d(nn.Module):
             ortho_weight=1e-5的情况下，在64像素猫头上，确实解决了专家死亡的问题，最低利用率在1%左右，
             绝大部分都启用了4个专家，少数启用3个专家，少数启用2个专家。
             数据说话就是，熵最低的也是在0.8左右波动，113个中只有1个。
-            熵在1左右波动的有3个
+            熵在1左右波动的有3个，
             观察到一个现象，部分专家间竞争震荡比较严重（ortho_weight=1e-5可能太大了，且学习率2e-4也太大了），利用率少的专家，几乎无震荡，且始终保持了1%的利用率。
+            经过测试，ortho_weight=1e-6，lr=1e-4这一组超参数不错，有效遏制专家死亡的前提下稳定了训练。
     """
 
     def __init__(self,
@@ -717,7 +718,7 @@ class AdaRMSNorm(nn.Module):
         return out
 
 
-class FlashAttentionCore(nn.Module):
+class SelfAttention(nn.Module):
     """
     核心注意力机制，不关心输入是图片还是序列，只处理 (B, N, C) 格式。
     默认包含 RoPE 和 Time-Aware QKV 投影。
@@ -799,6 +800,8 @@ class TimeAwareSwiGLU(nn.Module):
         t_gate = self.w_time(time_emb).unsqueeze(1)  # (B, 1, H)
 
         # 3. 时间感知门控 (Time-Aware Gating)
+        # 往往一些数值微小的差异，或者比例的差异，就会让状态完全不同
+        # 只需要在关键的临界点（Gate）上推一把，整个网络的推理路径就会发生分叉
         gate = self.act(c_gate * (1 + t_gate))
 
         # 4. 应用门控并输出
@@ -1176,7 +1179,7 @@ class SpatialSelfAttention(nn.Module):
         self.rms = factory.get_rms(
             channels=channels,
         )
-        self.attn = factory.get_attn(
+        self.attn = factory.get_selfattn(
             channels=channels,
             num_heads=num_heads,
         )
@@ -1212,7 +1215,7 @@ class TransformerBlock(nn.Module):
         self.rms1 = factory.get_rms(channels=channels)
 
         # Self Attention
-        self.attn = factory.get_attn(channels=channels, num_heads=num_heads)
+        self.attn = factory.get_selfattn(channels=channels, num_heads=num_heads)
 
         # FFN Norm
         self.rms2 = factory.get_rms(channels=channels)
@@ -1442,7 +1445,7 @@ class DiffusionTransUNet_64(nn.Module):
         self.down3 = DownsampleLayer(in_channels=320, out_channels=512, dense_inc=0, factory=factory)
 
         # ================= BOTTLENECK =================
-        self.bot_stage = BottleneckTransformerStage(in_channels=512, out_channels=512, inner_channels=1024, num_layers=8,
+        self.bot_stage = BottleneckTransformerStage(in_channels=512, out_channels=512, inner_channels=1024, num_layers=10,
                                                     num_heads=16, factory=factory)
 
         # ================= DECODER =================

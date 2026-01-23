@@ -18,7 +18,7 @@ if __name__ == "__main__":
             epochs=200,  # 训练轮数
             batch_size=28,  # 批次大小 (根据显存调整)
             accumulation_steps=10,  # 梯度累积
-            lr=5e-5,
+            lr=1e-4,
             device="cuda" if torch.cuda.is_available() else "cpu",
             save_path="ddpm_cat_model.pth",
             use_monitor=True
