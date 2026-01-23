@@ -62,6 +62,7 @@ def run_training(
 
             # ================= 计算 Loss =================
             loss = ddpm.compute_loss(images)
+            loss += unet.get_auxiliary_loss()
 
             # ================= 梯度累积 =================
             # Loss 除以累积步数，因为 backward 会累加梯度

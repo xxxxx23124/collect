@@ -20,7 +20,8 @@ if __name__ == "__main__":
             accumulation_steps=10,  # 梯度累积
             lr=2e-4,
             device="cuda" if torch.cuda.is_available() else "cpu",
-            save_path="ddpm_cat_model.pth"
+            save_path="ddpm_cat_model.pth",
+            use_monitor=True
         )
     else:
         print("Please fix the dataset paths first.")

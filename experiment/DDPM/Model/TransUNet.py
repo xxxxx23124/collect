@@ -433,6 +433,33 @@ class TimeAwareCondConv2d(nn.Module):
     Time-Aware CondConv: Dynamically aggregates expert kernels using both input features and time embeddings.
     Allows the convolution to adapt its behavior based on the current diffusion timestep (t).
     Maintains standard Conv2d interface while supporting groups and efficient batch processing.
+
+
+    关于添加噪声：
+        如 F.softmax(routing_logits + N(0,1), dim=1)
+        不添加任何人为噪音可能是适合DDPM的。
+
+    关于Softmax vs Sigmoid：
+        softmax(routing_logits) or sigmoid(routing_logits)
+       用softmax可能更适合DDPM。原本的sigmoid激活在图像分类/检测任务中可能影响不大
+       （例如当出现某种模式时，就是那个类别，检测任务中的定位的精确度也不像DDPM这么严格），
+       但在DDPM这一类要求精确的回归任务中，如果方差不可控，模型可能会消耗很多精力去适应sigmoid组合专家带来的统计分布变化。
+       这会导致严重的“内耗”。
+       补充：
+            经过不严谨的实验（没有专门控制变量），貌似使用Sigmoid激活，会让模型在前期采样的图容易变得全是黑的，或者全是白的（大概将近1/2都是全白全黑）。
+            使用Softmax的，全白全黑的现象少了很多（20个Epoch的采样，每个Epoch有105步左右，只出现了一次全白）
+
+    关于正则化：
+       目前决定不启用正则化强制让专家负载均衡。
+       原因：卷积核不像大语言模型中的专家（MLP），卷积核的参数容量很小，主要是做模式匹配。
+       在DDPM中，初期步（构图）和后期步（去噪）的任务差距很大，不同的卷积核天然倾向于负责不同阶段的任务。
+
+       目前添加得有使得专家正交的正则化，即专家间的知识不同。
+
+    实际测试 4专家 softmax(routing_logits) 无任何正则化，包括专家正交的正则化：
+        在简单数据集，如64像素猫头，会出现专家死亡
+        在复杂数据集，如64像素ImageNet，没有出现专家死亡，
+        但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
     """
 
     def __init__(self,
@@ -496,6 +523,34 @@ class TimeAwareCondConv2d(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
 
+    def get_ortho_loss(self):
+        """
+        计算正交正则化损失。
+        目标：让不同专家的卷积核方向尽可能垂直（不相似）。
+        """
+        # weight shape: [num_experts, out, in/g, k, k]
+        n_exp = self.num_experts
+
+        # 展平每个专家的参数向量
+        # [num_experts, N_params]
+        w_flat = self.weight.view(n_exp, -1)
+
+        # 归一化 (只看方向，不看模长)
+        w_norm = F.normalize(w_flat, p=2, dim=1)
+
+        # 计算 Gram 矩阵 (余弦相似度矩阵)
+        # [num_experts, num_experts]
+        gram = torch.mm(w_norm, w_norm.t())
+
+        # 目标是单位矩阵 Identity (对角线为1，其余为0)
+        # 减去对角线部分，只惩罚非对角线元素 (即不同专家之间的相似度)
+        identity = torch.eye(n_exp, device=w_flat.device)
+
+        # Frobenius 范数
+        ortho_loss = torch.norm(gram - identity, p='fro')
+
+        return ortho_loss
+
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -503,31 +558,6 @@ class TimeAwareCondConv2d(nn.Module):
             time_emb (Tensor): Time embedding vector [B, D] indicating noise level.
         Returns:
             Tensor: Output feature map computed with time-adaptive kernels.
-
-        关于添加噪声：
-        1. 关于噪声：不添加任何人为噪音可能是适合DDPM的。
-
-        2. 关于Softmax vs Sigmoid：
-           用softmax可能更适合DDPM。原本的sigmoid激活在图像分类/检测任务中可能影响不大
-           （例如当出现某种模式时，就是那个类别，检测任务中的定位的精确度也不像DDPM这么严格），
-           但在DDPM这一类要求精确的回归任务中，如果方差不可控，模型可能会消耗很多精力去适应sigmoid组合专家带来的统计分布变化。
-           这会导致严重的“内耗”。
-           补充：
-                经过不严谨的实验（没有专门控制变量），貌似使用Sigmoid激活，会让模型在前期采样的图容易变得全是黑的，或者全是白的（大概将近1/2都是全白全黑）。
-                使用Softmax的，全白全黑的现象少了很多（20个Epoch的采样，每个Epoch有105步左右，只出现了一次全白）
-
-        3. 关于正则化：
-           目前决定不启用正则化强制让专家负载均衡。
-           原因：卷积核不像大语言模型中的专家（MLP），卷积核的参数容量很小，主要是做模式匹配。
-           一个核如果被迫去学多种模式，必然导致精度下降。
-           在DDPM中，初期步（构图）和后期步（去噪）的任务差距很大，不同的卷积核天然倾向于负责不同阶段的任务。
-           如果在某些时刻路由学会了组合专家（例如 0.5*A + 0.5*B），那是为了增强表达能力。
-           如果强行加正则，强制保证每一个卷积核的利用率，反而会破坏这种自然的分工，造成模型性能下降。
-           
-        4. 实际测试 4专家：
-            在简单数据集，如64像素猫头，会出现专家死亡
-            在复杂数据集，如64像素ImageNet，没有出现专家死亡，
-            但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
         """
 
         B, C, H, W = x.shape
@@ -1486,6 +1516,20 @@ class DiffusionTransUNet_64(nn.Module):
         x = self.dec3(x, t_emb)
 
         return self.final(x, t_emb)
+
+    def get_auxiliary_loss(self, ortho_weight=1e-5):
+        """
+        在计算主 Loss后，调用此函数获取额外的正则化 Loss。
+        total_loss = mse_loss + aux_loss
+        """
+        ortho_loss_total = 0.0
+
+        # 遍历模型中所有的 TimeAwareCondConv2d
+        for module in self.modules():
+            if isinstance(module, TimeAwareCondConv2d):
+                ortho_loss_total += module.get_ortho_loss()
+
+        return ortho_weight * ortho_loss_total
 
 
 # ================= 测试代码 =================
