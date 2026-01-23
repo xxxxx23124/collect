@@ -461,7 +461,7 @@ class TimeAwareCondConv2d(nn.Module):
             在简单数据集，如64像素猫头，会出现专家死亡
             在复杂数据集，如64像素ImageNet，没有出现专家死亡，
             但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
-        使用了专家正交正则化：
+        使用了专家正交正则化(老旧粗糙的实现，即计算整个专家与其他专家的相似度，而非逐通道)：
             ortho_weight=1e-5的情况下，在64像素猫头上，确实解决了专家死亡的问题，最低利用率在1%左右，
             绝大部分都启用了4个专家，少数启用3个专家，少数启用2个专家。
             数据说话就是，熵最低的也是在0.8左右波动，113个中只有1个。
@@ -533,31 +533,40 @@ class TimeAwareCondConv2d(nn.Module):
 
     def get_ortho_loss(self):
         """
-        计算正交正则化损失。
-        目标：让不同专家的卷积核方向尽可能垂直（不相似）。
+        逐输出通道计算专家间的正交性。
+        目标：对于第 i 个输出通道，Expert A 的卷积核应当与 Expert B 的卷积核尽可能不相似。
+        这样保证了 Router 对每一个特征通道都有实际的控制权。
         """
-        # weight shape: [num_experts, out, in/g, k, k]
-        n_exp = self.num_experts
+        # weight shape: [num_experts, out_channels, in_channels//groups, k, k]
+        w = self.weight
+        n_exp, out_c, in_per_grp, k, k = w.shape
 
-        # 展平每个专家的参数向量
-        # [num_experts, N_params]
-        w_flat = self.weight.view(n_exp, -1)
+        # 1. 重塑张量
+        # 我们希望把 (out_channels) 视为 Batch 维度
+        # 将张量变为: [out_channels, num_experts, fan_in]
+        # fan_in = in_per_grp * k * k (单个卷积核的参数量)
+        w_per_channel = w.permute(1, 0, 2, 3, 4).reshape(out_c, n_exp, -1)
 
-        # 归一化 (只看方向，不看模长)
-        w_norm = F.normalize(w_flat, p=2, dim=1)
+        # 2. 归一化 (只关注方向，不关注模长)
+        # dim=2 表示沿着 fan_in 维度归一化，得到单位向量
+        w_norm = F.normalize(w_per_channel, p=2, dim=2)
 
-        # 计算 Gram 矩阵 (余弦相似度矩阵)
-        # [num_experts, num_experts]
-        gram = torch.mm(w_norm, w_norm.t())
+        # 3. 计算 Gram 矩阵 (Batch Matrix Multiplication)
+        # [out_c, n_exp, fan_in] @ [out_c, fan_in, n_exp] -> [out_c, n_exp, n_exp]
+        # 结果是 out_c 个 (n_exp x n_exp) 的相似度矩阵
+        gram = torch.bmm(w_norm, w_norm.transpose(1, 2).contiguous())
 
-        # 目标是单位矩阵 Identity (对角线为1，其余为0)
-        # 减去对角线部分，只惩罚非对角线元素 (即不同专家之间的相似度)
-        identity = torch.eye(n_exp, device=w_flat.device)
+        # 4. 构建目标矩阵 (Identity)
+        # [out_c, n_exp, n_exp]
+        identity = torch.eye(n_exp, device=w.device).unsqueeze(0).expand(out_c, n_exp, n_exp)
 
-        # Frobenius 范数
-        ortho_loss = torch.norm(gram - identity, p='fro')
+        # 5. 计算 Loss
+        # 计算 Frobenius 范数，表示当前相似度矩阵与单位矩阵的距离
+        # dim=(1, 2) 对每个通道内的矩阵求范数
+        diff = torch.norm(gram - identity, p='fro', dim=(1, 2))
 
-        return ortho_loss
+        # 6. 对所有通道取平均
+        return diff.mean()
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
