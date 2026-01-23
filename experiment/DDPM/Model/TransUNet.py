@@ -456,10 +456,17 @@ class TimeAwareCondConv2d(nn.Module):
 
        目前添加得有使得专家正交的正则化，即专家间的知识不同。
 
-    实际测试 4专家 softmax(routing_logits) 无任何正则化，包括专家正交的正则化：
-        在简单数据集，如64像素猫头，会出现专家死亡
-        在复杂数据集，如64像素ImageNet，没有出现专家死亡，
-        但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
+    实际测试 4专家 softmax(routing_logits)：
+        无任何正则化，包括专家正交的正则化：
+            在简单数据集，如64像素猫头，会出现专家死亡
+            在复杂数据集，如64像素ImageNet，没有出现专家死亡，
+            但在encoder的enc2中，可能因为难度不够大，导致可能只利用2个专家，其余专家保持1e-4级别的利用率。
+        使用了专家正交正则化：
+            ortho_weight=1e-5的情况下，在64像素猫头上，确实解决了专家死亡的问题，最低利用率在1%左右，
+            绝大部分都启用了4个专家，少数启用3个专家，少数启用2个专家。
+            数据说话就是，熵最低的也是在0.8左右波动，113个中只有1个。
+            熵在1左右波动的有3个
+            观察到一个现象，部分专家间竞争震荡比较严重（ortho_weight=1e-5可能太大了，且学习率2e-4也太大了），利用率少的专家，几乎无震荡，且始终保持了1%的利用率。
     """
 
     def __init__(self,
@@ -1517,7 +1524,7 @@ class DiffusionTransUNet_64(nn.Module):
 
         return self.final(x, t_emb)
 
-    def get_auxiliary_loss(self, ortho_weight=1e-5):
+    def get_auxiliary_loss(self, ortho_weight=1e-6):
         """
         在计算主 Loss后，调用此函数获取额外的正则化 Loss。
         total_loss = mse_loss + aux_loss

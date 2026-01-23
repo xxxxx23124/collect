@@ -8,7 +8,7 @@ from experiment.DDPM.Model.TransUNet import DiffusionTransUNet_64
 
 if __name__ == "__main__":
     # 1. 实例化数据集
-    dataset = ImagenetDataset()
+    dataset = CatDataset()
 
     # 2. 只有当找到图片时才开始训练
     if len(dataset) > 0:
@@ -18,7 +18,7 @@ if __name__ == "__main__":
             epochs=200,  # 训练轮数
             batch_size=28,  # 批次大小 (根据显存调整)
             accumulation_steps=10,  # 梯度累积
-            lr=2e-4,
+            lr=5e-5,
             device="cuda" if torch.cuda.is_available() else "cpu",
             save_path="ddpm_cat_model.pth",
             use_monitor=True
