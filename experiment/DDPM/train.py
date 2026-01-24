@@ -72,7 +72,6 @@ def run_training(
             # 还原主 Loss 数值用于打印
             loss_val = loss_main.item() * accumulation_steps
             epoch_loss += loss_val
-            avg_loss = epoch_loss / len(dataloader)
 
             # 用于日志记录 (还原数值)
             batch_loss += loss_main.item()
@@ -111,6 +110,7 @@ def run_training(
         # 每个 Epoch 结束后调整学习率
         scheduler.step()
 
+        avg_loss = epoch_loss / len(dataloader)
         print(f"📉 Epoch {epoch + 1} Average Loss: {avg_loss:.4f}")
 
         # 每隔 10 个 epoch 保存一次，并尝试采样看效果
