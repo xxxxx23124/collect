@@ -24,6 +24,28 @@ class Factory:
         但CLN也是重新调制不同通道的重要性，但会重新归一化均值与方差，然后再次放缩，这会导致权重调制多余,
         因此这里还需要实现一个普通卷积。
         """
+        self.info = """
+        关于这个模型，作者的出于兴趣爱好设计的，因此没有做简化，
+        如 encoder 中的 DualPathBlock模块 中的 conv3_up、conv3_res、conv3_dense 都没必要用CondConv。
+        作者的喜好是追求 学习速度 + 容量，对于学习速度这一块，如果将Bottleneck替换为DualPathStage，模型能够学得飞快。
+        作者感觉，DDPM中UNet使用时间来调制通道权重背后的假设是：
+            不同通道间传递的信息的不同的，不同的去噪阶段需要用不同的信息。
+            比如 通道1 在噪声含量高时工作，在噪声含量底时被抑制。
+            随着时间t的传入，一个UNet实际上完成了多个UNet子网络的功能。
+            
+            换一个视角看，也许也不是这样。
+            作者过去观察过一个 dim 是 4 的RNN的隐藏状态变化趋势，
+            是状态预测任务，作者观察到 
+            A -> xxxxxx -> (A，需要预测)
+            B -> xxxxxx -> (B，需要预测)
+            注：这两个 xxxxxx 是一模一样的序列
+            在 xxxxxx 阶段时，RNN 内部的隐藏状态 的数值变化趋势是相似的，但是在比例/大小上的微小不同，让网络区分了 A 还是 B。
+            也许时间带来的调制，会显著改变UNet内的工作。
+            这也是 TimeAwareSwiGLU 的这样设计的原因。
+        """
+
+    def get_info(self):
+        print(self.info)
 
     def get_condconv(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False):
         return TimeAwareCondConv2d(
@@ -1169,13 +1191,13 @@ class FeatureFusionBlock(nn.Module):
 
         这是从另一个角度对于激活函数的思考，
         DownsampleLayer 和 PixelShuffleUpsampleLayer 是不带激活的，因为这两个模块所在路径是模型链路最长的路径，
-        我们希望信息尽量完整地流入下一个模块，因为上一模块，和下一模块的 语义是相似的，正数和负数代表的信息是相似的，有规律的
+        我们希望信息尽量完整地流入下一个模块，因为上一模块，和下一模块的 语义是相似的，正数和负数代表的信息是相似的，有规律的。
         而 FeatureFusionBlock 呢，这个模块位置十分的特殊，和重要，这是 UNet 最核心的部件之一，
         Encoder 是眼睛，Bottleneck是大脑，Decoder是手，
         Encoder看到50%噪声的图，会提取特征，传入 Bottleneck，
         Bottleneck 按照自己的记忆添加指导意见，传入 Decoder，
         Decoder 需要结合 Bottleneck的指导意见和来自Encoder看到的特征图重建图像（虽然这里预测的是噪声）
-        这下问题来了，Encoder 的输出，和 Encoder -> Bottleneck 的输出，语义可能是不相同的，正数和负数代表的信息是不相似的，规律难寻的，
+        这下问题来了，Encoder 的输出，和 Encoder -> Bottleneck 的输出，语义可能是不相同的，正数和负数代表的信息是不相似的，规律难寻的。
         如果直接线性映射，我们在数学的角度看，可以看作每一个特征图都是 这个FeatureFusionBlock 中的 1x1卷积核的相似度计算，
         这个 1x1卷积核 中会有两种模式，一半是对应 Encoder的信息，一半是对应 Encoder -> Bottleneck 的信息，
         1x1卷积核为了保证信息的有效性，大概率是无法完全利用 来自 Encoder的信息 和 Encoder -> Bottleneck 的信息的，因为，
