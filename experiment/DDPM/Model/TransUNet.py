@@ -438,6 +438,10 @@ class TimeAwareCondConv2d(nn.Module):
     关于添加噪声：
         如 F.softmax(routing_logits + N(0,1), dim=1)
         不添加任何人为噪音可能是适合DDPM的。
+        大概就是我发现模型loss卡在 0.025左右下不去了（我没有继续训练，可能这个不是下限）
+        怎么说呢，加了噪声后，模型的输出变成了 N(mu，sigma_{noise}^2)，对于MSE的期望 即:
+        E((hat{y} - y_{true})^2) = (mu - y_{true})^2 + sigma_{noise}^2
+        这里的这个sigma_{noise}^2是模型永远无法消除的。所以loss会遇到一个无法突破的瓶颈。
 
     关于Softmax vs Sigmoid：
         softmax(routing_logits) or sigmoid(routing_logits)
