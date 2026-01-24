@@ -434,7 +434,6 @@ class TimeAwareCondConv2d(nn.Module):
     Allows the convolution to adapt its behavior based on the current diffusion timestep (t).
     Maintains standard Conv2d interface while supporting groups and efficient batch processing.
 
-
     关于添加噪声：
         如 F.softmax(routing_logits + N(0,1), dim=1)
         不添加任何人为噪音可能是适合DDPM的。
@@ -472,6 +471,22 @@ class TimeAwareCondConv2d(nn.Module):
             熵在1左右波动的有3个，
             观察到一个现象，部分专家间竞争震荡比较严重（ortho_weight=1e-5可能太大了，且学习率2e-4也太大了），利用率少的专家，几乎无震荡，且始终保持了1%的利用率。
             经过测试，ortho_weight=1e-6，lr=1e-4这一组超参数不错，有效遏制专家死亡的前提下稳定了训练。
+
+    目前的实现是将整个通道与 1 个专家绑定，如果对通道解绑，即 softmax输出 每个卷积核的混合比例。
+    作者认为这是非常高风险的，作者在超网络上是了很多苦头，同时也见识到超网络的强大。不过鉴于目前网络已经很庞大，没必要追求高风险。
+    下面是一个实际想象：
+        现状 (Grouped Experts)：
+            Router 选择一组 (k_1, k_2, ..., k_n)
+            这保证了通道间的相关性被保留。
+            Expert 1 的第 3 个通道和第 5 个通道是协同训练的，它们知道彼此的存在。
+        如果独立选择 (Per-channel Routing / Dynamic Conv)：
+            即 Router 为每个输入通道单独生成一个卷积核。
+            这会让参数空间爆炸。
+            致命问题：通道解耦。第 3 通道选了 Kernel A，第 5 通道选了 Kernel B。
+            Kernel A 和 B 从未配合过，直接组合会导致 Feature Map 的方差极其不稳定（Internal Covariate Shift）。
+            DDPM 对方差极度敏感（因为它是预测噪声的 参考：sigmoid激活导致方差不稳定的负面影响）
+            但严格来说，sigmoid是可以生成图片的，只是不稳定，同样，这个独立选择理论也是可行的，
+            但也只是理论上，实际训练可能会遇到几乎无法收敛的情况。
     """
 
     def __init__(self,
@@ -1410,7 +1425,7 @@ class TimeAwareToRGB(nn.Module):
         assert out_channels == 3, "out_channels should be 3."
         # 使用 AdaCLN 做最后的归一化，确保去噪结束时的分布也受时间控制
         self.cln = factory.get_cln(channels=in_channels)
-        self.conv =         factory.get_condconv(
+        self.conv = factory.get_condconv(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=3,
