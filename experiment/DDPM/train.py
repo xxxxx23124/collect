@@ -60,23 +60,33 @@ def run_training(
             # 重要：DDPM 假设输入在 [-1, 1]，如果 DataLoader 输出是 [0, 1]，需要转换
             # images = images * 2.0 - 1.0
 
-            # ================= 计算 Loss =================
-            loss = ddpm.compute_loss(images)
-            loss += unet.get_auxiliary_loss()
+            # ================= 1. 计算主 Loss (依赖数据) =================
+            loss_main = ddpm.compute_loss(images)
 
-            # ================= 梯度累积 =================
-            # Loss 除以累积步数，因为 backward 会累加梯度
-            loss = loss / accumulation_steps
-            loss.backward()
+            # 梯度累积
+            # 除以累积步数，因为 backward 会累加梯度
+            loss_main = loss_main / accumulation_steps
+            # 反向传播主 Loss
+            loss_main.backward()
 
-            # ================= minibatch梯度合成完整batch梯度 =================
-            batch_loss += loss.item()
+            # 还原主 Loss 数值用于打印
+            loss_val = loss_main.item() * accumulation_steps
+            epoch_loss += loss_val
+            avg_loss = epoch_loss / len(dataloader)
+
+            # 用于日志记录 (还原数值)
+            batch_loss += loss_main.item()
 
             # 计数器 +1
             accum_counter += 1
 
             # 只有满足累积步数时才进行更新
             if accum_counter % accumulation_steps == 0:
+                # 正则化 Loss 只与权重有关，与 Batch 大小无关，
+                # 所以不需要除以 accumulation_steps，直接加一次梯度即可。
+                aux_loss = unet.get_auxiliary_loss()
+                aux_loss.backward()
+
                 # 梯度裁剪 (Max Norm 通常设为 1.0)
                 torch.nn.utils.clip_grad_norm_(ddpm.parameters(), max_norm=1.0)
 
@@ -93,17 +103,14 @@ def run_training(
                     monitor.writer.add_scalar("Train/Loss", batch_loss, global_step)
                     monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
 
+                # 重置累积的 batch_loss
                 batch_loss = 0
-
-            # 还原 Loss 数值用于打印
-            loss_val = loss.item() * accumulation_steps
-            epoch_loss += loss_val
 
             progress_bar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}", "global step:": f"{global_step}"})
 
         # 每个 Epoch 结束后调整学习率
         scheduler.step()
-        avg_loss = epoch_loss / len(dataloader)
+
         print(f"📉 Epoch {epoch + 1} Average Loss: {avg_loss:.4f}")
 
         # 每隔 10 个 epoch 保存一次，并尝试采样看效果

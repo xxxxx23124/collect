@@ -21,7 +21,7 @@ if __name__ == "__main__":
             lr=1e-4,
             device="cuda" if torch.cuda.is_available() else "cpu",
             save_path="ddpm_cat_model.pth",
-            use_monitor=True
+            use_monitor=False
         )
     else:
         print("Please fix the dataset paths first.")

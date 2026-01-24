@@ -37,7 +37,7 @@ class Factory:
             bias=bias,
             num_experts=self.num_experts
         )
-    def get_normconv(self,):
+    def get_conv(self, ):
         raise NotImplementedError(self.get_conv_error)
 
     def get_convmod(self, ):
@@ -1496,6 +1496,11 @@ class DiffusionTransUNet_64(nn.Module):
         # ================= OUTPUT =================
         self.final = TimeAwareToRGB(in_channels=144, out_channels=out_channels, factory=factory)
 
+        # 在初始化时缓存所有 CondConv 层，避免每次计算 loss 时遍历整个网络
+        self.cond_conv_layers = [
+            m for m in self.modules() if isinstance(m, TimeAwareCondConv2d)
+        ]
+
     def forward(self, x, time):
         t_emb = self.time_mlp(time)
         x = self.stem(x, t_emb)
@@ -1542,11 +1547,8 @@ class DiffusionTransUNet_64(nn.Module):
         total_loss = mse_loss + aux_loss
         """
         ortho_loss_total = 0.0
-
-        # 遍历模型中所有的 TimeAwareCondConv2d
-        for module in self.modules():
-            if isinstance(module, TimeAwareCondConv2d):
-                ortho_loss_total += module.get_ortho_loss()
+        for module in self.cond_conv_layers:
+            ortho_loss_total += module.get_ortho_loss()
 
         return ortho_weight * ortho_loss_total
 
