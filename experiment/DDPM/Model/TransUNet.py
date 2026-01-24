@@ -473,7 +473,7 @@ class TimeAwareCondConv2d(nn.Module):
             经过测试，ortho_weight=1e-6，lr=1e-4这一组超参数不错，有效遏制专家死亡的前提下稳定了训练。
 
     目前的实现是将整个通道与 1 个专家绑定，如果对通道解绑，即 softmax输出 每个卷积核的混合比例。
-    作者认为这是非常高风险的，作者在超网络上是了很多苦头，同时也见识到超网络的强大。不过鉴于目前网络已经很庞大，没必要追求高风险。
+    作者认为这是非常高风险的，作者在超网络上吃了很多苦头，同时也见识到超网络的强大。不过鉴于目前网络已经很庞大，没必要追求高风险。
     下面是一个实际想象：
         现状 (Grouped Experts)：
             Router 选择一组 (k_1, k_2, ..., k_n)
@@ -1063,7 +1063,7 @@ class DownsampleLayer(nn.Module):
 class PixelShuffleUpsampleLayer(nn.Module):
     """
     追求质量的 PixelShuffle 上采样层。
-    结构: LN -> AdaCLN -> Conv(in, out*4) -> PixelShuffle -> (concat -> AdaCLN -> SiLU)
+    结构: AdaCLN -> Conv(in, out*4) -> PixelShuffle -> (concat -> AdaCLN -> SiLU)
 
     以下是对这个模块中的一些超参数设置的解释：
         TimeAwareCondConv2d 的 bias=False：
@@ -1164,10 +1164,26 @@ class FeatureFusionBlock(nn.Module):
     结构: AdaCLN -> SiLU -> 1x1 TimeAwareCondConv
 
     为什么要加激活函数呢？
-    这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
-    同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
+        这是我的直觉，我觉得通道数是足够传递信息的（应该还冗余），不用担心激活损坏信息，
+        同时受到MaxPooling的启发，也许加一个激活，保留下强的信号，过滤弱的信号，可以有利于模型学习更鲁棒的特征
 
-    这个模块是Decoder中的DualPathStage的开始，也就意味着这个模块是残差直连到底的，就不开bias了
+        这是从另一个角度对于激活函数的思考，
+        DownsampleLayer 和 PixelShuffleUpsampleLayer 是不带激活的，因为这两个模块所在路径是模型链路最长的路径，
+        我们希望信息尽量完整地流入下一个模块，因为上一模块，和下一模块的 语义是相似的，正数和负数代表的信息是相似的，有规律的
+        而 FeatureFusionBlock 呢，这个模块位置十分的特殊，和重要，这是 UNet 最核心的部件之一，
+        Encoder 是眼睛，Bottleneck是大脑，Decoder是手，
+        Encoder看到50%噪声的图，会提取特征，传入 Bottleneck，
+        Bottleneck 按照自己的记忆添加指导意见，传入 Decoder，
+        Decoder 需要结合 Bottleneck的指导意见和来自Encoder看到的特征图重建图像（虽然这里预测的是噪声）
+        这下问题来了，Encoder 的输出，和 Encoder -> Bottleneck 的输出，语义可能是不相同的，正数和负数代表的信息是不相似的，规律难寻的，
+        如果直接线性映射，我们在数学的角度看，可以看作每一个特征图都是 这个FeatureFusionBlock 中的 1x1卷积核的相似度计算，
+        这个 1x1卷积核 中会有两种模式，一半是对应 Encoder的信息，一半是对应 Encoder -> Bottleneck 的信息，
+        1x1卷积核为了保证信息的有效性，大概率是无法完全利用 来自 Encoder的信息 和 Encoder -> Bottleneck 的信息的，因为，
+        这两个向量有正有负，卷积运算时最终是求和，导致正负相互抵消，这可能不利于FeatureFusionBlock提取有效的信息，
+        而加了SiLU激活后，负数被抑制（代表一种信息被抑制），这天然有利于 FeatureFusionBlock 的 1x1 卷积去做模式匹配，不用被负数干扰了。
+        这样也许可以更好地完成信息的整合。
+
+    这个模块是Decoder中的DualPathStage的开始，也就意味着这个模块是残差直连到底的，就不开bias了。
     """
 
     def __init__(self,
