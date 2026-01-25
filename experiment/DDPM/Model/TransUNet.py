@@ -5,9 +5,27 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
+# ================================================
+# 该模型到此为止 2026/1/25 by Xingqian She
+# 这里必须承认代码/注释比较粗糙
+# 未来可能方向：
+#   纯CNN->轻量：
+#       Elucidating the Design Space of Diffusion-Based Generative Models 外部治理
+#       StyleGan2 权重调制的内部治理
+#       全面去除 AdaCLN，修改GRN与去除RMSNorm
+#       全面去除CondConv（如果权重调制+多专家，可能遇到难以优化的问题）
+#   CNN + transformer：
+#       保持当前结构的情况下，用 RMSNorm 代替 CLN
+#       毕竟，CLN 和 RMSNorm 都是 Point-wise / Token-wise的
+#       CLN -> 减去均值 μ，除以标准差 σ -> 强制向量的中心回到 0，方差回到 1。它抹除了“平移”信息。
+#       RMSNorm -> 只除以均方根 (RMS) -> 强制向量的尺度（Scale）回到 1，但不改变它的中心位置。
+#       它保留了“平移”带来的语义信息，且计算量少了一步减法。
+# ================================================
+
 
 class Factory:
     """
+    统一管理 模型的共用参数/共用组件。
     统一管理 CondConv 和普通 Conv 的生成。
     统一管理 Transformer组件的生成。
     """
@@ -19,13 +37,14 @@ class Factory:
         self.attn_head_dim = attn_head_dim
         self.rope = RoPE2D(dim=self.attn_head_dim)
         self.get_conv_error = """
-        作者是懒鬼，现在还没实现这个，如果要实现，作者会参考style_gan 2中权重调制，但需要注意，权重调制的成果会被CLN消除.
-        权重调制，在作者眼中的为了放缩不同通道的重要性（不调制均值），与GRN很搭配（GRN看通道的能量，与均值有关），
-        但CLN也是重新调制不同通道的重要性，但会重新归一化均值与方差，然后再次放缩，这会导致权重调制多余,
+        作者是懒鬼，现在还没实现这个。如果要实现，作者会参考 StyleGAN2 中的权重调制。
+        但需要注意，权重调制本质上是改变特征通道的方差（幅度）。
+        如果后续接了 CLN，CLN 的归一化步骤（除以标准差）会消除这种方差的改变，导致权重调制失去意义。
         因此这里还需要实现一个普通卷积。
+        权重调制，作者认为与GRN很搭配（GRN看通道的能量，与均值有关）。
         """
         self.info = """
-        关于这个模型，作者的出于兴趣爱好设计的，因此没有做简化，
+        关于这个模型，作者是出于兴趣爱好设计的，因此没有做简化，
         如 encoder 中的 DualPathBlock模块 中的 conv3_up、conv3_res、conv3_dense 都没必要用CondConv。
         作者的喜好是追求 学习速度 + 容量，对于学习速度这一块，如果将Bottleneck替换为DualPathStage，模型能够学得飞快。
         作者感觉，DDPM中UNet使用时间来调制通道权重背后的假设是：
