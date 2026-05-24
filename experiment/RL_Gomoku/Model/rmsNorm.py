@@ -10,7 +10,7 @@ class RMSNorm(nn.Module):
         dim (int): 输入特征的维度。
         eps (float): 为保证数值稳定性加在分母上的一个很小的值。
     """
-    def __init__(self, dim, eps: float = 1e-8):
+    def __init__(self, dim, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         # 'weight' 是 RMSNorm 的可学习增益参数

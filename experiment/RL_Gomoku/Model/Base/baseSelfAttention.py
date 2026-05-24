@@ -155,18 +155,17 @@ class BaseSelfAttention(nn.Module, ABC):
 
         return out
 
-if __name__ == '__main__':
-    class SelfAttention(BaseSelfAttention):
-        """
-        标准多头自注意力。
+class SelfAttention(BaseSelfAttention):
+    """
+    标准多头自注意力。
 
-        Q/K/V 都来自同一个输入 x。
-        """
+    Q/K/V 都来自同一个输入 x。
+    """
 
-        def _init_projections(self, **kwargs):
-            d_model = kwargs["d_model"]
+    def _init_projections(self, **kwargs):
+        d_model = kwargs["d_model"]
 
-            self.q_proj = nn.Linear(d_model, d_model)
-            self.k_proj = nn.Linear(d_model, d_model)
-            self.v_proj = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
 

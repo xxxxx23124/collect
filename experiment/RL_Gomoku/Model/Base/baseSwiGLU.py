@@ -167,16 +167,16 @@ class BaseSwiGLU(nn.Module, ABC):
         return output
 
 
-if __name__ == '__main__':
-    class SwiGLU(BaseSwiGLU):
-        """
-        标准 SwiGLU FFN。
-        """
-        def _init_sublayers(self, **kwargs):
-            input_dim = kwargs["input_dim"]
-            output_dim = kwargs["output_dim"]
-            up_proj_dim = kwargs["up_proj_dim"]
 
-            self.gate_proj = nn.Linear(input_dim, up_proj_dim)
-            self.up_proj = nn.Linear(input_dim, up_proj_dim)
-            self.down_proj = nn.Linear(up_proj_dim, output_dim)
+class SwiGLU(BaseSwiGLU):
+    """
+    标准 SwiGLU FFN。
+    """
+    def _init_sublayers(self, **kwargs):
+        input_dim = kwargs["input_dim"]
+        output_dim = kwargs["output_dim"]
+        up_proj_dim = kwargs["up_proj_dim"]
+
+        self.gate_proj = nn.Linear(input_dim, up_proj_dim, bias=False)
+        self.up_proj = nn.Linear(input_dim, up_proj_dim, bias=False)
+        self.down_proj = nn.Linear(up_proj_dim, output_dim, bias=False)

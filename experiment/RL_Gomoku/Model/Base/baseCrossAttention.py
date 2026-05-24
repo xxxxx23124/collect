@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from abc import ABC, abstractmethod
 
+from experiment.RL_Gomoku.Model.RoPE2D import RoPE2D
+
 
 class BaseCrossAttention(nn.Module, ABC):
     """
@@ -15,6 +17,7 @@ class BaseCrossAttention(nn.Module, ABC):
         3. 不使用 causal mask
         4. Query 来自 x
         5. Key/Value 来自 context
+        6. 使用位置编码
 
     输入:
         x:       (B, S_q, D)
@@ -80,6 +83,7 @@ class BaseCrossAttention(nn.Module, ABC):
         self,
         x: torch.Tensor,
         context: torch.Tensor,
+        rotary_emb: RoPE2D | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -88,6 +92,9 @@ class BaseCrossAttention(nn.Module, ABC):
 
             context:
                 Key/Value 输入，shape = (B, S_kv, D_context)
+
+            rotary_emb:
+                RoPE2D 输入. Query, Key = rotary_emb(Query, Key)
 
         Returns:
             out:
@@ -122,7 +129,16 @@ class BaseCrossAttention(nn.Module, ABC):
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
 
-        # 3. Cross-Attention
+        # 3. 应用 RoPE2D
+        # 注意：RoPE 只作用于 q/k，不作用于 v
+        if rotary_emb is not None:
+            q, k = rotary_emb(q, k)
+
+        # 4. Cross-Attention
+        # 对五子棋棋盘来说：
+        #   不需要 causal mask
+        #   不需要 padding mask
+        #   所有格子 token 都可以互相看见
         attn_out = F.scaled_dot_product_attention(
             q,
             k,
@@ -132,29 +148,29 @@ class BaseCrossAttention(nn.Module, ABC):
             is_causal=False,
         )
 
-        # 4. 合并多头
+        # 5. 合并多头
         attn_out = rearrange(attn_out, "b h s d -> b s (h d)")
 
-        # 5. 输出投影
+        # 6. 输出投影
         out = self.out_proj(attn_out)
         out = self.proj_dropout(out)
 
         return out
 
-if __name__ == '__main__':
-    class CrossAttention(BaseCrossAttention):
-        """
-        标准交叉注意力。
 
-        Query 来自 x。
-        Key/Value 来自 context。
-        """
+class CrossAttention(BaseCrossAttention):
+    """
+    标准交叉注意力。
 
-        def _init_projections(self, **kwargs):
-            d_model = kwargs["d_model"]
-            d_context = kwargs.get("d_context", d_model)
+    Query 来自 x。
+    Key/Value 来自 context。
+    """
 
-            self.q_proj = nn.Linear(d_model, d_model)
-            self.k_proj = nn.Linear(d_context, d_model)
-            self.v_proj = nn.Linear(d_context, d_model)
+    def _init_projections(self, **kwargs):
+        d_model = kwargs["d_model"]
+        d_context = kwargs.get("d_context", d_model)
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_context, d_model, bias=False)
+        self.v_proj = nn.Linear(d_context, d_model, bias=False)
 
