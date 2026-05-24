@@ -1,7 +1,10 @@
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any
+
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from typing import Tuple
+from torch.distributions import Categorical
 
 from experiment.RL_Gomoku.Model.rmsNorm import RMSNorm
 from experiment.RL_Gomoku.Model.RoPE2D import RoPE2D
@@ -10,256 +13,659 @@ from experiment.RL_Gomoku.Model.Base.baseCrossAttention import CrossAttention
 from experiment.RL_Gomoku.Model.Base.baseSwiGLU import SwiGLU
 
 
-# ==========================================
-# 1. 模型配置类 (极度方便后期扩展和修改超参数)
-# ==========================================
 @dataclass
 class GomokuConfig:
-    board_size: int = 15  # 五子棋盘大小 15x15
-    in_channels: int = 2  # 输入 2 个通道 (己方，对方)
-    d_model: int = 128  # 隐藏层维度
-    num_heads: int = 4  # 注意力头数
-    encoder_layers: int = 3  # 编码器层数 (提取全局 Value 特征)
-    decoder_layers: int = 3  # 解码器层数 (计算局部 Policy 策略)
-    ffn_up_dim: int = 342  # SwiGLU 升维大小 (通常是 8/3 * d_model，这里取近值)
+    """
+    五子棋 Transformer 配置。
 
-    # 强化学习 PPO 专用设置：坚决不用 Dropout
+    输入:
+        state: (B, 2, board_size, board_size)
+
+    输出:
+        policy_logits: (B, board_size * board_size)
+        value: (B, 1)
+    """
+
+    board_size: int = 15
+    in_channels: int = 2
+
+    d_model: int = 128
+    num_heads: int = 4
+
+    encoder_layers: int = 3
+    decoder_layers: int = 3
+
+    # SwiGLU 推荐大约 8/3 * d_model
+    ffn_up_dim: Optional[int] = None
+
     attn_dropout: float = 0.0
     proj_dropout: float = 0.0
     ffn_dropout: float = 0.0
+
+    # Value head 配置
+    value_hidden_dim: int = 256
+    value_use_tanh: bool = True
+
+    # mask 后的非法动作 logit
+    invalid_logit: float = -1e9
+
+    def __post_init__(self):
+        if self.board_size <= 0:
+            raise ValueError(f"board_size must be positive, got {self.board_size}")
+
+        if self.in_channels <= 0:
+            raise ValueError(f"in_channels must be positive, got {self.in_channels}")
+
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+
+        if self.num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
+
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"d_model must be divisible by num_heads, "
+                f"got d_model={self.d_model}, num_heads={self.num_heads}"
+            )
+
+        if self.encoder_layers < 0:
+            raise ValueError(f"encoder_layers must >= 0, got {self.encoder_layers}")
+
+        if self.decoder_layers < 0:
+            raise ValueError(f"decoder_layers must >= 0, got {self.decoder_layers}")
+
+        if self.ffn_up_dim is None:
+            # LLaMA/SwiGLU 常用近似：8/3 * d_model
+            self.ffn_up_dim = int(8 * self.d_model / 3)
 
     @property
     def seq_len(self) -> int:
         return self.board_size * self.board_size
 
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.num_heads
 
-# ==========================================
-# 专门为 2D 棋盘设计的 CNN 特征提取器
-# ==========================================
+
 class BoardCNNTokenizer(nn.Module):
+    """
+    将棋盘状态编码成 token 序列。
+
+    输入:
+        x: (B, 2, H, W)
+
+    输出:
+        tokens: (B, H * W, d_model)
+    """
+
     def __init__(self, config: GomokuConfig):
         super().__init__()
+
         hidden_dim = config.d_model // 2
 
-        self.conv1 = nn.Conv2d(config.in_channels, hidden_dim, kernel_size=3, padding=1, bias=False)
-        # GroupNorm(1, C) 等价于在 C 维度做 LayerNorm，天然支持 4D 张量
-        self.norm1 = nn.GroupNorm(1, hidden_dim)
-        self.act1 = nn.SiLU()
+        self.net = nn.Sequential(
+            nn.Conv2d(
+                in_channels=config.in_channels,
+                out_channels=hidden_dim,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(1, hidden_dim),
+            nn.SiLU(),
 
-        self.conv2 = nn.Conv2d(hidden_dim, config.d_model, kernel_size=3, padding=1, bias=False)
-        self.norm2 = nn.GroupNorm(1, config.d_model)
-        self.act2 = nn.SiLU()
+            nn.Conv2d(
+                in_channels=hidden_dim,
+                out_channels=config.d_model,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(1, config.d_model),
+            nn.SiLU(),
+        )
 
         self.final_norm = RMSNorm(config.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act1(self.norm1(self.conv1(x)))
-        x = self.act2(self.norm2(self.conv2(x)))
+        x = self.net(x)
 
-        # (B, C, H, W) -> (B, C, H*W) -> (B, H*W, C)
-        B, C, H, W = x.shape
-        x = x.view(B, C, H * W).transpose(1, 2).contiguous()
-        return self.final_norm(x)
+        b, c, h, w = x.shape
+
+        # (B, C, H, W) -> (B, H * W, C)
+        x = x.flatten(2).transpose(1, 2).contiguous()
+
+        x = self.final_norm(x)
+
+        return x
 
 
-# ==========================================
-# 2. 核心模块构建：Encoder 层与 Decoder 层
-# ==========================================
-class EncoderLayer(nn.Module):
-    """单层 Encoder：负责自注意力融合，提取棋盘全局特征"""
+class EncoderBlock(nn.Module):
+    """
+    Transformer Encoder Block。
+
+    Pre-Norm:
+        x = x + SelfAttention(Norm(x))
+        x = x + FFN(Norm(x))
+    """
 
     def __init__(self, config: GomokuConfig):
         super().__init__()
-        self.norm1 = RMSNorm(config.d_model)
-        self.attn = SelfAttention(
+
+        self.attn_norm = RMSNorm(config.d_model)
+        self.self_attn = SelfAttention(
             d_model=config.d_model,
             num_heads=config.num_heads,
             attn_dropout=config.attn_dropout,
-            proj_dropout=config.proj_dropout
+            proj_dropout=config.proj_dropout,
         )
-        self.norm2 = RMSNorm(config.d_model)
+
+        self.ffn_norm = RMSNorm(config.d_model)
         self.ffn = SwiGLU(
             input_dim=config.d_model,
             output_dim=config.d_model,
             up_proj_dim=config.ffn_up_dim,
             hidden_dropout=config.ffn_dropout,
-            output_dropout=config.ffn_dropout
+            output_dropout=config.ffn_dropout,
         )
 
     def forward(self, x: torch.Tensor, rope: RoPE2D) -> torch.Tensor:
-        # Pre-Norm 架构 (LLaMA 标配，训练极稳定)
-        x = x + self.attn(self.norm1(x), rotary_emb=rope)
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.self_attn(
+            self.attn_norm(x),
+            rotary_emb=rope,
+        )
+
+        x = x + self.ffn(
+            self.ffn_norm(x),
+        )
+
         return x
 
 
-class DecoderLayer(nn.Module):
-    """单层 Decoder：负责根据 Encoder 传来的大局观，结合自身位置计算落子策略"""
+class DecoderBlock(nn.Module):
+    """
+    Transformer Decoder Block。
+
+    用于 policy head：
+        1. decoder token 自注意力
+        2. decoder token 对 encoder 全局特征做 cross attention
+        3. FFN
+    """
 
     def __init__(self, config: GomokuConfig):
         super().__init__()
-        # Decoder 自身的 Self-Attention
-        self.norm1 = RMSNorm(config.d_model)
+
+        self.self_attn_norm = RMSNorm(config.d_model)
         self.self_attn = SelfAttention(
-            d_model=config.d_model, num_heads=config.num_heads,
-            attn_dropout=config.attn_dropout, proj_dropout=config.proj_dropout
-        )
-        # 与 Encoder 交互的 Cross-Attention
-        self.norm2 = RMSNorm(config.d_model)
-        self.cross_attn = CrossAttention(
-            d_model=config.d_model, num_heads=config.num_heads, d_context=config.d_model,
-            attn_dropout=config.attn_dropout, proj_dropout=config.proj_dropout
-        )
-        # 前馈网络
-        self.norm3 = RMSNorm(config.d_model)
-        self.ffn = SwiGLU(
-            input_dim=config.d_model, output_dim=config.d_model, up_proj_dim=config.ffn_up_dim,
-            hidden_dropout=config.ffn_dropout, output_dropout=config.ffn_dropout
+            d_model=config.d_model,
+            num_heads=config.num_heads,
+            attn_dropout=config.attn_dropout,
+            proj_dropout=config.proj_dropout,
         )
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor, rope: RoPE2D) -> torch.Tensor:
-        x = x + self.self_attn(self.norm1(x), rotary_emb=rope)
-        x = x + self.cross_attn(x=self.norm2(x), context=context, rotary_emb=rope)
-        x = x + self.ffn(self.norm3(x))
+        self.cross_attn_norm = RMSNorm(config.d_model)
+        self.cross_attn = CrossAttention(
+            d_model=config.d_model,
+            num_heads=config.num_heads,
+            d_context=config.d_model,
+            attn_dropout=config.attn_dropout,
+            proj_dropout=config.proj_dropout,
+        )
+
+        self.ffn_norm = RMSNorm(config.d_model)
+        self.ffn = SwiGLU(
+            input_dim=config.d_model,
+            output_dim=config.d_model,
+            up_proj_dim=config.ffn_up_dim,
+            hidden_dropout=config.ffn_dropout,
+            output_dropout=config.ffn_dropout,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope: RoPE2D,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(
+            self.self_attn_norm(x),
+            rotary_emb=rope,
+        )
+
+        x = x + self.cross_attn(
+            x=self.cross_attn_norm(x),
+            context=context,
+            rotary_emb=rope,
+        )
+
+        x = x + self.ffn(
+            self.ffn_norm(x),
+        )
+
         return x
+
+
+class ValueHead(nn.Module):
+    """
+    Critic Value Head。
+
+    输入:
+        enc_out: (B, N, d_model)
+
+    输出:
+        value: (B, 1)
+
+    这里采用 mean pooling，更轻、更稳定。
+    """
+
+    def __init__(self, config: GomokuConfig):
+        super().__init__()
+
+        layers = [
+            RMSNorm(config.d_model),
+            nn.Linear(config.d_model, config.value_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.value_hidden_dim, 1),
+        ]
+
+        if config.value_use_tanh:
+            layers.append(nn.Tanh())
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, enc_out: torch.Tensor) -> torch.Tensor:
+        # (B, N, C) -> (B, C)
+        pooled = enc_out.mean(dim=1)
+
+        # (B, C) -> (B, 1)
+        value = self.net(pooled)
+
+        return value
+
+
+class PolicyHead(nn.Module):
+    """
+    Actor Policy Head。
+
+    输入:
+        dec_out: (B, N, d_model)
+
+    输出:
+        logits: (B, N)
+    """
+
+    def __init__(self, config: GomokuConfig):
+        super().__init__()
+
+        self.norm = RMSNorm(config.d_model)
+        self.proj = nn.Linear(config.d_model, 1)
+
+    def forward(self, dec_out: torch.Tensor) -> torch.Tensor:
+        dec_out = self.norm(dec_out)
+
+        logits = self.proj(dec_out).squeeze(-1)
+
+        return logits
 
 
 class GomokuTransformer(nn.Module):
+    """
+    五子棋 Actor-Critic Transformer。
+
+    输入:
+        state:
+            shape = (B, 2, 15, 15)
+
+        valid_mask:
+            shape = (B, 225)
+            dtype = torch.bool
+            True 表示可以落子，False 表示非法动作。
+
+    输出:
+        policy_logits:
+            shape = (B, 225)
+
+        value:
+            shape = (B, 1)
+    """
+
     def __init__(self, config: GomokuConfig):
         super().__init__()
+
         self.config = config
 
-        # 1. CNN Tokenizer
         self.tokenizer = BoardCNNTokenizer(config)
 
-        # 2. RoPE2D
         self.rope2d = RoPE2D(
-            head_dim=config.d_model // config.num_heads,
+            head_dim=config.head_dim,
             height=config.board_size,
-            width=config.board_size
+            width=config.board_size,
         )
 
-        # 3. Encoders
-        self.encoders = nn.ModuleList([
-            EncoderLayer(config) for _ in range(config.encoder_layers)
-        ])
+        self.encoders = nn.ModuleList(
+            [EncoderBlock(config) for _ in range(config.encoder_layers)]
+        )
         self.encoder_norm = RMSNorm(config.d_model)
 
-        # 4. Decoders
-        self.decoders = nn.ModuleList([
-            DecoderLayer(config) for _ in range(config.decoder_layers)
-        ])
+        self.decoders = nn.ModuleList(
+            [DecoderBlock(config) for _ in range(config.decoder_layers)]
+        )
         self.decoder_norm = RMSNorm(config.d_model)
 
-        # 5. Value (Critic)
-        self.value_proj = nn.Linear(config.d_model, 2)
-        flatten_dim = config.seq_len * 2
-        self.value_mlp = nn.Sequential(
-            nn.Linear(flatten_dim, 128, bias=False),
-            nn.SiLU(),
-            nn.Linear(128, 1, bias=False),
-            nn.Tanh()
-        )
-
-        # 6. Policy Head
-        self.policy_head = nn.Linear(config.d_model, 1)
+        self.value_head = ValueHead(config)
+        self.policy_head = PolicyHead(config)
 
         self.apply(self._init_weights)
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module):
+        """
+        更完整的初始化：
+        - Linear: 正态初始化
+        - Conv2d: Kaiming 初始化，更适合 CNN + SiLU
+        """
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(
+                module.weight,
+                mode="fan_out",
+                nonlinearity="relu",
+            )
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def encode(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        编码棋盘。
+
+        Returns:
+            tokens:
+                tokenizer 输出，shape = (B, N, C)
+
+            enc_out:
+                encoder 输出，shape = (B, N, C)
+        """
+        tokens = self.tokenizer(state)
+
+        enc_out = tokens
+        for block in self.encoders:
+            enc_out = block(enc_out, self.rope2d)
+
+        enc_out = self.encoder_norm(enc_out)
+
+        return tokens, enc_out
+
+    def decode(
+        self,
+        tokens: torch.Tensor,
+        enc_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        解码 policy 特征。
+
+        Returns:
+            dec_out: (B, N, C)
+        """
+        dec_out = tokens
+
+        for block in self.decoders:
+            dec_out = block(
+                x=dec_out,
+                context=enc_out,
+                rope=self.rope2d,
+            )
+
+        dec_out = self.decoder_norm(dec_out)
+
+        return dec_out
+
+    def apply_action_mask(
+        self,
+        logits: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        对非法动作进行 mask。
+
+        Args:
+            logits:
+                shape = (B, N)
+
+            valid_mask:
+                shape = (B, N), bool
+
+        Returns:
+            masked_logits:
+                shape = (B, N)
+        """
+        if valid_mask is None:
+            return logits
+
+        if valid_mask.dtype != torch.bool:
+            valid_mask = valid_mask.bool()
+
+        if valid_mask.shape != logits.shape:
+            raise ValueError(
+                f"valid_mask shape must be same as logits shape, "
+                f"got valid_mask={valid_mask.shape}, logits={logits.shape}"
+            )
+
+        # 正常情况下不应该出现全 False。
+        # 如果出现，Categorical 会出问题，所以提前报错更好。
+        if not valid_mask.any(dim=-1).all():
+            raise ValueError("Each sample must have at least one valid action.")
+
+        logits = logits.masked_fill(
+            ~valid_mask,
+            self.config.invalid_logit,
+        )
+
+        return logits
 
     def forward(
         self,
         state: torch.Tensor,
-        valid_mask: torch.Tensor = None
+        valid_mask: Optional[torch.Tensor] = None,
+        return_features: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            state: (B, 2, 15, 15) 你的环境输出的张量
-            valid_mask: (B, 225) boolean张量，True表示合法动作。用于 PPO 动作屏蔽。
+            state:
+                shape = (B, 2, board_size, board_size)
+
+            valid_mask:
+                shape = (B, board_size * board_size)
+
+            return_features:
+                如果为 True，额外返回中间特征字典。
+
         Returns:
-            policy_logits: (B, 225)
-            value: (B, 1)
+            policy_logits:
+                shape = (B, board_size * board_size)
+
+            value:
+                shape = (B, 1)
+
+            features: optional dict
         """
-        # --- A. CNN 提取特征 ---
-        # (B, 2, 15, 15) -> (B, 225, d_model)
-        x = self.tokenizer(state)
+        if state.dim() != 4:
+            raise ValueError(
+                f"state must be 4D tensor: (B, C, H, W), got shape={state.shape}"
+            )
 
-        # --- B. 编码器全局融合 ---
-        enc_out = x
-        for encoder in self.encoders:
-            enc_out = encoder(enc_out, self.rope2d)
-        enc_out = self.encoder_norm(enc_out)
+        b, c, h, w = state.shape
 
-        # --- C. 计算 Value ---
-        # 1. 通道降维: (B, 225, d_model) -> (B, 225, 2)
-        v_feat = self.value_proj(enc_out)
-        # 2. 展平空间: (B, 225, 2) -> (B, 450)
-        v_feat = v_feat.view(v_feat.size(0), -1)
-        # 3. MLP 输出: (B, 450) -> (B, 1)
-        value = self.value_mlp(v_feat)
+        if c != self.config.in_channels:
+            raise ValueError(
+                f"state channel mismatch, expected {self.config.in_channels}, got {c}"
+            )
 
-        # --- D. 解码器交叉注意力 ---
-        dec_out = x
-        for decoder in self.decoders:
-            dec_out = decoder(dec_out, context=enc_out, rope=self.rope2d)
-        dec_out = self.decoder_norm(dec_out)
+        if h != self.config.board_size or w != self.config.board_size:
+            raise ValueError(
+                f"board size mismatch, expected "
+                f"{self.config.board_size}x{self.config.board_size}, got {h}x{w}"
+            )
 
-        # --- E. 计算 Policy ---
-        # (B, 225, 1) -> (B, 225)
-        policy_logits = self.policy_head(dec_out).squeeze(-1)
+        tokens, enc_out = self.encode(state)
 
-        # --- F. 合法动作屏蔽 (Action Masking) ---
-        # 如果传入了 mask，把不能下的地方设为极其小的负数，Softmax 之后概率就是 0
-        if valid_mask is not None:
-            # PPO 训练中，强烈建议在这里直接屏蔽掉无效动作！
-            policy_logits = policy_logits.masked_fill(~valid_mask, -1e9)
+        value = self.value_head(enc_out)
+
+        dec_out = self.decode(
+            tokens=tokens,
+            enc_out=enc_out,
+        )
+
+        policy_logits = self.policy_head(dec_out)
+
+        policy_logits = self.apply_action_mask(
+            logits=policy_logits,
+            valid_mask=valid_mask,
+        )
+
+        if return_features:
+            features: Dict[str, Any] = {
+                "tokens": tokens,
+                "enc_out": enc_out,
+                "dec_out": dec_out,
+            }
+            return policy_logits, value, features
 
         return policy_logits, value
 
+    @torch.no_grad()
+    def act(
+        self,
+        state: torch.Tensor,
+        valid_mask: torch.Tensor,
+        deterministic: bool = False,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        方便 Agent 调用的动作选择函数。
+
+        Args:
+            state:
+                shape = (B, 2, board_size, board_size)
+
+            valid_mask:
+                shape = (B, board_size * board_size)
+
+            deterministic:
+                True 则选择 argmax，False 则采样。
+
+            temperature:
+                采样温度。越小越贪心。
+
+        Returns:
+            action:
+                shape = (B,)
+
+            log_prob:
+                shape = (B,)
+
+            value:
+                shape = (B,)
+        """
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+
+        logits, value = self.forward(
+            state=state,
+            valid_mask=valid_mask,
+        )
+
+        logits = logits / temperature
+
+        dist = Categorical(logits=logits)
+
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
+
+        log_prob = dist.log_prob(action)
+
+        return action, log_prob, value.squeeze(-1)
+
+    def get_action_distribution(
+        self,
+        state: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+    ) -> Tuple[Categorical, torch.Tensor]:
+        """
+        PPO 更新时很方便：
+
+            dist, value = model.get_action_distribution(...)
+            log_prob = dist.log_prob(actions)
+            entropy = dist.entropy()
+
+        Returns:
+            dist:
+                Categorical distribution
+
+            value:
+                shape = (B,)
+        """
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+
+        logits, value = self.forward(
+            state=state,
+            valid_mask=valid_mask,
+        )
+
+        logits = logits / temperature
+
+        dist = Categorical(logits=logits)
+
+        return dist, value.squeeze(-1)
+
 
 if __name__ == "__main__":
-    from torchinfo import summary
-    from experiment.RL_Gomoku.Env.GomokuEnv import GomokuEnv
+    config = GomokuConfig(
+        board_size=15,
+        in_channels=2,
+        d_model=256,
+        num_heads=8,
+        encoder_layers=6,
+        decoder_layers=6,
+    )
 
-    env = GomokuEnv()
-
-    # 实例化网络
-    config = GomokuConfig()
     model = GomokuTransformer(config)
 
+    batch_size = 2
 
-    # 获取环境初始状态
-    state, info = env.reset()
+    state = torch.zeros(
+        batch_size,
+        2,
+        config.board_size,
+        config.board_size,
+        dtype=torch.float32,
+    )
 
-    # 转换为 Tensor，并增加 Batch 维度
-    # state 形状: (2, 15, 15) -> (1, 2, 15, 15)
-    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+    valid_mask = torch.ones(
+        batch_size,
+        config.seq_len,
+        dtype=torch.bool,
+    )
 
-    # 获取 valid_mask 并转换为 Tensor
-    valid_mask = torch.tensor(info["valid_mask"], dtype=torch.bool).unsqueeze(0)
+    logits, value = model(state, valid_mask)
 
-    # 前向传播 (带上 Mask)
-    policy_logits, value = model(state_tensor, valid_mask=valid_mask)
+    print("logits:", logits.shape)
+    print("value:", value.shape)
 
-    # 计算落子概率分布
-    import torch.nn.functional as F
+    action, log_prob, value = model.act(
+        state,
+        valid_mask,
+        deterministic=False,
+    )
 
-    probs = F.softmax(policy_logits, dim=-1)
-
-    print("Value 胜率评估:", value.item())
-    print("当前无法落子的地方的 Logits (应为 -1e9):", policy_logits[0, 0].item() if not valid_mask[0, 0] else "可落子")
-
-    # 根据网络采样一个合法动作
-    m = torch.distributions.Categorical(probs)
-    action = m.sample().item()
-
-    print(f"网络选择的落子点 (1D 索引): {action}")
-    print(f"坐标: {divmod(action, 15)}")
-
-    summary(model, input_size=(2, 2, 15, 15), device="cpu")
-
+    print("action:", action)
+    print("log_prob:", log_prob)
+    print("value:", value)

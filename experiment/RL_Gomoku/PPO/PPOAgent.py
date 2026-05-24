@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
 
 
 class PPOAgent:
@@ -8,7 +7,7 @@ class PPOAgent:
         self,
         model: nn.Module,
         lr: float = 3e-4,
-        weight_decay: float = 0.0,
+        weight_decay: float = 1e-4,
         device: str = None,
     ):
         if device is None:
@@ -24,63 +23,54 @@ class PPOAgent:
         )
 
     @torch.no_grad()
-    def act(self, state, valid_mask):
-        """
-        Args:
-            state: np.ndarray, shape = (2, 15, 15)
-            valid_mask: np.ndarray, shape = (225,)
-
-        Returns:
-            action: int
-            log_prob: float
-            value: float
-        """
+    def act(
+        self,
+        state,
+        valid_mask,
+        deterministic: bool = False,
+        temperature: float = 1.0,
+    ):
         self.model.eval()
 
-        state_tensor = torch.tensor(
+        state_tensor = torch.as_tensor(
             state,
             dtype=torch.float32,
             device=self.device,
         ).unsqueeze(0)
 
-        mask_tensor = torch.tensor(
+        mask_tensor = torch.as_tensor(
             valid_mask,
             dtype=torch.bool,
             device=self.device,
         ).unsqueeze(0)
 
-        logits, value = self.model(state_tensor, valid_mask=mask_tensor)
-
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+        action, log_prob, value = self.model.act(
+            state=state_tensor,
+            valid_mask=mask_tensor,
+            deterministic=deterministic,
+            temperature=temperature,
+        )
 
         return (
             action.item(),
             log_prob.item(),
-            value.squeeze(-1).item(),
+            value.item(),
         )
 
-    def evaluate_actions(self, states, masks, actions):
-        """
-        PPO 更新时使用。
+    def evaluate_actions(
+        self,
+        states,
+        masks,
+        actions,
+    ):
+        self.model.train()
 
-        Args:
-            states: Tensor, shape = (B, 2, 15, 15)
-            masks: Tensor, shape = (B, 225)
-            actions: Tensor, shape = (B,)
-
-        Returns:
-            log_probs: Tensor, shape = (B,)
-            entropy: Tensor, shape = (B,)
-            values: Tensor, shape = (B,)
-        """
-        logits, values = self.model(states, valid_mask=masks)
-
-        dist = Categorical(logits=logits)
+        dist, values = self.model.get_action_distribution(
+            state=states,
+            valid_mask=masks,
+        )
 
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
-        values = values.squeeze(-1)
 
         return log_probs, entropy, values

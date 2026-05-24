@@ -13,18 +13,7 @@ def main():
         invalid_move_mode="raise",
     )
 
-    model_config = GomokuConfig(
-        board_size=15,
-        in_channels=2,
-        d_model=256,
-        num_heads=8,
-        encoder_layers=6,
-        decoder_layers=6,
-        ffn_up_dim=682,
-        attn_dropout=0.0,
-        proj_dropout=0.0,
-        ffn_dropout=0.0,
-    )
+    model_config = GomokuConfig()
 
     model = GomokuTransformer(model_config)
 
@@ -35,25 +24,7 @@ def main():
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
-    ppo_config = PPOConfig(
-        gamma=0.99,
-
-        rollout_episodes=16,
-
-        ppo_epochs=4,
-        batch_size=256,
-
-        clip_ratio=0.2,
-        value_coef=0.5,
-        entropy_coef=0.01,
-
-        max_grad_norm=1.0,
-
-        save_interval=50,
-        log_interval=1,
-
-        save_dir="./gomoku_ppo_checkpoints",
-    )
+    ppo_config = PPOConfig()
 
     trainer = PPOTrainer(
         env=env,

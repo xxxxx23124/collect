@@ -23,7 +23,7 @@ class PPOConfig:
 
     max_grad_norm: float = 1.0
 
-    save_interval: int = 50
+    save_interval: int = 100
     log_interval: int = 1
 
     save_dir: str = "./gomoku_ppo_checkpoints"
