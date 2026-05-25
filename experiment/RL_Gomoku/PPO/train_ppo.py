@@ -13,7 +13,10 @@ def main():
         invalid_move_mode="raise",
     )
 
-    model_config = GomokuConfig()
+    model_config = GomokuConfig(
+        board_size=15,
+        in_channels=2,
+    )
 
     model = GomokuTransformer(model_config)
 

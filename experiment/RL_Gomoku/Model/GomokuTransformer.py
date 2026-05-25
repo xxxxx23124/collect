@@ -29,11 +29,11 @@ class GomokuConfig:
     board_size: int = 15
     in_channels: int = 2
 
-    d_model: int = 128
+    d_model: int = 512
     num_heads: int = 4
 
-    encoder_layers: int = 3
-    decoder_layers: int = 3
+    encoder_layers: int = 8
+    decoder_layers: int = 8
 
     # SwiGLU 推荐大约 8/3 * d_model
     ffn_up_dim: Optional[int] = None
@@ -43,7 +43,7 @@ class GomokuConfig:
     ffn_dropout: float = 0.0
 
     # Value head 配置
-    value_hidden_dim: int = 256
+    value_hidden_dim: int = 512
     value_use_tanh: bool = True
 
     # mask 后的非法动作 logit

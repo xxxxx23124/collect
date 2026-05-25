@@ -10,7 +10,7 @@ from experiment.RL_Gomoku.PPO.PPOBuffer import RolloutBuffer
 
 @dataclass
 class PPOConfig:
-    gamma: float = 0.99
+    gamma: float = 0.9999
 
     rollout_episodes: int = 16
 
