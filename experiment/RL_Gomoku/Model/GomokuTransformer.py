@@ -29,11 +29,11 @@ class GomokuConfig:
     board_size: int = 15
     in_channels: int = 2
 
-    d_model: int = 512
-    num_heads: int = 4
+    d_model: int = 384
+    num_heads: int = 6
 
-    encoder_layers: int = 8
-    decoder_layers: int = 8
+    encoder_layers: int = 6
+    decoder_layers: int = 6
 
     # SwiGLU 推荐大约 8/3 * d_model
     ffn_up_dim: Optional[int] = None
@@ -43,7 +43,8 @@ class GomokuConfig:
     ffn_dropout: float = 0.0
 
     # Value head 配置
-    value_hidden_dim: int = 512
+    # 默认与 d_model 保持一致
+    value_hidden_dim: Optional[int] = None
     value_use_tanh: bool = True
 
     # mask 后的非法动作 logit
@@ -77,6 +78,9 @@ class GomokuConfig:
         if self.ffn_up_dim is None:
             # LLaMA/SwiGLU 常用近似：8/3 * d_model
             self.ffn_up_dim = int(8 * self.d_model / 3)
+
+        if self.value_hidden_dim is None:
+            self.value_hidden_dim = self.d_model
 
     @property
     def seq_len(self) -> int:
@@ -129,8 +133,6 @@ class BoardCNNTokenizer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
-
-        b, c, h, w = x.shape
 
         # (B, C, H, W) -> (B, H * W, C)
         x = x.flatten(2).transpose(1, 2).contiguous()
@@ -250,12 +252,10 @@ class ValueHead(nn.Module):
     Critic Value Head。
 
     输入:
-        enc_out: (B, N, d_model)
+        enc_out: (B, N+1, d_model)
 
     输出:
         value: (B, 1)
-
-    这里采用 mean pooling，更轻、更稳定。
     """
 
     def __init__(self, config: GomokuConfig):
@@ -274,11 +274,12 @@ class ValueHead(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, enc_out: torch.Tensor) -> torch.Tensor:
-        # (B, N, C) -> (B, C)
-        pooled = enc_out.mean(dim=1)
+        # enc_out shape: (B, 1 + N, C)
+        # 提取 [CLS] token 的特征，它总是位于索引 0
+        cls_feat = enc_out[:, 0, :]  # (B, C)
 
-        # (B, C) -> (B, 1)
-        value = self.net(pooled)
+        # MLP 输出 Value
+        value = self.net(cls_feat)
 
         return value
 
@@ -342,6 +343,11 @@ class GomokuTransformer(nn.Module):
             width=config.board_size,
         )
 
+        # [CLS] token / 可学习
+        # shape: (1, 1, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        nn.init.normal_(self.cls_token, std=0.02)
+
         self.encoders = nn.ModuleList(
             [EncoderBlock(config) for _ in range(config.encoder_layers)]
         )
@@ -379,26 +385,27 @@ class GomokuTransformer(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def encode(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def encode(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        编码棋盘。
+        Args:
+            tokens (B, N, C)
 
         Returns:
-            tokens:
-                tokenizer 输出，shape = (B, N, C)
-
-            enc_out:
-                encoder 输出，shape = (B, N, C)
+            encoder (B, N, C)
         """
-        tokens = self.tokenizer(state)
+        B = tokens.shape[0]
 
-        enc_out = tokens
+        # 拼接 [CLS] token
+        cls_tokens = self.cls_token.expand(B, -1, -1) # (B, 1, C)
+        enc_out = torch.cat((cls_tokens, tokens), dim=1)
+
         for block in self.encoders:
             enc_out = block(enc_out, self.rope2d)
 
         enc_out = self.encoder_norm(enc_out)
 
-        return tokens, enc_out
+        return enc_out
 
     def decode(
         self,
@@ -511,7 +518,9 @@ class GomokuTransformer(nn.Module):
                 f"{self.config.board_size}x{self.config.board_size}, got {h}x{w}"
             )
 
-        tokens, enc_out = self.encode(state)
+        tokens = self.tokenizer(state)
+
+        enc_out = self.encode(tokens)
 
         value = self.value_head(enc_out)
 
@@ -631,11 +640,7 @@ if __name__ == "__main__":
     config = GomokuConfig(
         board_size=15,
         in_channels=2,
-        d_model=256,
-        num_heads=8,
-        encoder_layers=6,
-        decoder_layers=6,
-    )
+        )
 
     model = GomokuTransformer(config)
 

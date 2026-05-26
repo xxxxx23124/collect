@@ -12,7 +12,7 @@ class RoPE2D(nn.Module):
     对于 15x15 五子棋：
         height = 15
         width = 15
-        seq_len = 225
+        seq_len = 225 / 225 + 1 cls token
 
     设计思路：
         head_dim 被分成两半：
@@ -228,6 +228,8 @@ class RoPE2D(nn.Module):
 
         Returns:
             shape = (B, num_heads, seq_len, head_dim)
+
+        自动识别是否包含 [CLS] token，不处理 [CLS] token
         """
         if x.ndim != 4:
             raise ValueError(
@@ -240,19 +242,34 @@ class RoPE2D(nn.Module):
                 f"Expected head_dim={self.head_dim}, but got {x.shape[-1]}"
             )
 
-        if x.shape[2] > self.seq_len:
+        seq_len = x.shape[2]
+        has_cls = False
+        if seq_len == self.seq_len + 1:
+            has_cls = True
+        elif seq_len != self.seq_len:
             raise ValueError(
-                f"seq_len={x.shape[2]} is larger than height*width={self.seq_len}. "
-                f"If you use extra tokens like CLS, apply RoPE only to board tokens."
+                f"Expected seq_len to be {self.seq_len} (board) or {self.seq_len + 1} (CLS + board), "
+                f"but got {seq_len}"
             )
 
+        if has_cls:
+            cls_token = x[:, :, 0:1, :]  # shape: (B, num_heads, 1, head_dim)
+            board_tokens = x[:, :, 1:, :]  # shape: (B, num_heads, 225, head_dim)
+        else:
+            board_tokens = x
+
         # 前一半是 y 方向特征，后一半是 x 方向特征
-        y_part, x_part = x.chunk(2, dim=-1)
+        y_part, x_part = board_tokens.chunk(2, dim=-1)
 
         y_part = self._apply_axis_rope(y_part, self.cos_y, self.sin_y)
         x_part = self._apply_axis_rope(x_part, self.cos_x, self.sin_x)
 
-        return torch.cat([y_part, x_part], dim=-1)
+        board_tokens_rotated = torch.cat([y_part, x_part], dim=-1)
+
+        if has_cls:
+            return torch.cat([cls_token, board_tokens_rotated], dim=2)
+        else:
+            return board_tokens_rotated
 
     def forward(
         self,

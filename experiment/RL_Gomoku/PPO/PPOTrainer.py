@@ -12,10 +12,10 @@ from experiment.RL_Gomoku.PPO.PPOBuffer import RolloutBuffer
 class PPOConfig:
     gamma: float = 0.9999
 
-    rollout_episodes: int = 16
+    rollout_episodes: int = 32
 
     ppo_epochs: int = 4
-    batch_size: int = 256
+    batch_size: int = 128
 
     clip_ratio: float = 0.2
     value_coef: float = 0.5
