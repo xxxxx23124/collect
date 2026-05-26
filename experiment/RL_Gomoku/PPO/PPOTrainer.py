@@ -19,7 +19,7 @@ class PPOConfig:
 
     clip_ratio: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.03
 
     max_grad_norm: float = 1.0
 
