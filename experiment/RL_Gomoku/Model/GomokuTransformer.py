@@ -47,6 +47,9 @@ class GomokuConfig:
     value_hidden_dim: Optional[int] = None
     value_use_tanh: bool = True
 
+    # Policy head 配置
+    policy_hidden_dim: Optional[int] = None
+
     # mask 后的非法动作 logit
     invalid_logit: float = -1e9
 
@@ -81,6 +84,9 @@ class GomokuConfig:
 
         if self.value_hidden_dim is None:
             self.value_hidden_dim = self.d_model
+
+        if self.policy_hidden_dim is None:
+            self.policy_hidden_dim = self.d_model
 
     @property
     def seq_len(self) -> int:
@@ -262,7 +268,6 @@ class ValueHead(nn.Module):
         super().__init__()
 
         layers = [
-            RMSNorm(config.d_model),
             nn.Linear(config.d_model, config.value_hidden_dim),
             nn.SiLU(),
             nn.Linear(config.value_hidden_dim, 1),
@@ -298,13 +303,17 @@ class PolicyHead(nn.Module):
     def __init__(self, config: GomokuConfig):
         super().__init__()
 
-        self.norm = RMSNorm(config.d_model)
-        self.proj = nn.Linear(config.d_model, 1)
+        layers = [
+            nn.Linear(config.d_model, config.policy_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.policy_hidden_dim, 1),
+        ]
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, dec_out: torch.Tensor) -> torch.Tensor:
-        dec_out = self.norm(dec_out)
 
-        logits = self.proj(dec_out).squeeze(-1)
+        logits = self.net(dec_out).squeeze(-1)
 
         return logits
 
