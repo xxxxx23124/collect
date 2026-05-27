@@ -1,6 +1,5 @@
 # alphazero/mcts.py
 
-import copy
 import math
 from typing import Dict, Optional, Tuple
 
@@ -97,7 +96,7 @@ class AlphaZeroMCTS:
             self._add_dirichlet_noise(root)
 
         for _ in range(self.num_simulations):
-            env_copy = copy.deepcopy(env)
+            env_copy = env.clone()
             self._simulate(env_copy, root)
 
         visit_counts = np.zeros(self.action_size, dtype=np.float32)

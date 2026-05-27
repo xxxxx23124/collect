@@ -54,7 +54,7 @@ def main():
     config = GomokuConfig()
     model = GomokuTransformer(config).to(device)
 
-    ckpt_path = "./gomoku_ppo_checkpoints/gomoku_ppo_iter_.pt"
+    ckpt_path = "./gomoku_ppo_checkpoints/gomoku_ppo_iter_200.pt"
 
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model"])

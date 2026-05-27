@@ -6,7 +6,7 @@ import numpy as np
 
 from experiment.RL_Gomoku.Env.GomokuEnv import GomokuEnv
 from experiment.RL_Gomoku.AlphaZero.mcts import AlphaZeroMCTS
-
+from experiment.RL_Gomoku.AlphaZero.augmentation import augment_samples
 
 def select_action_from_pi(
     pi: np.ndarray,
@@ -139,7 +139,15 @@ def run_self_play_games(
             device=device,
         )
 
-        for state, valid_mask, pi, z in samples:
+        if az_config.use_symmetry_augmentation:
+            samples_to_add = augment_samples(
+                samples=samples,
+                board_size=az_config.board_size,
+            )
+        else:
+            samples_to_add = samples
+
+        for state, valid_mask, pi, z in samples_to_add:
             replay_buffer.add(
                 state=state,
                 valid_mask=valid_mask,

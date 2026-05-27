@@ -83,6 +83,14 @@ class GomokuEnv:
         opp = (self.board == (3 - self.current_player)).astype(np.float32)
         return np.stack([own, opp], axis=0)
 
+    def clone(self):
+        new_env = GomokuEnv(self.board_size)
+        new_env.board = self.board.copy()
+        new_env.current_player = self.current_player
+        new_env.done = self.done
+        new_env.winner = self.winner
+        return new_env
+
     def get_valid_mask(self):
         return self.board.reshape(-1) == 0
 

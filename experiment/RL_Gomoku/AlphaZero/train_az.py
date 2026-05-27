@@ -38,17 +38,7 @@ def save_checkpoint(
 
 
 def main():
-    az_config = AlphaZeroTrainConfig(
-        board_size=15,
-
-        # 先用小一点的参数验证流程
-        num_simulations=50,
-        num_self_play_games_per_iter=4,
-        train_steps_per_iter=100,
-
-        batch_size=64,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
+    az_config = AlphaZeroTrainConfig()
 
     device = torch.device(az_config.device)
 
@@ -58,6 +48,11 @@ def main():
     )
 
     model = GomokuTransformer(model_config).to(device)
+
+    if az_config.load_dir is not None:
+        ckpt = torch.load(az_config.load_dir, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        print(f"{az_config.load_dir} loaded.")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
