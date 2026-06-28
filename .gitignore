@@ -45,7 +45,6 @@ env/
 *.hdf5
 
 # Image / figure files (图像、图表)
-*.png
 *.jpg
 *.jpeg
 *.gif
