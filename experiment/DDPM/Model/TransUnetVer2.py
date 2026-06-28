@@ -933,6 +933,7 @@ class CrossFusionBlock(nn.Module):
                 width: int) -> torch.Tensor:
         B, N, C = state_tokens.shape
         query_tokens = cnn_tokens + self.query_mix * (state_tokens - cnn_tokens)
+        query_map = query_tokens.transpose(1, 2).reshape(B, C, height, width)
         cross_tokens = self.cross_attn(
             self.q_norm(query_tokens, time_emb),
             self.kv_norm(state_tokens, time_emb),
@@ -942,7 +943,7 @@ class CrossFusionBlock(nn.Module):
 
         cross_map = cross_tokens.transpose(1, 2).reshape(B, C, height, width)
         cross_map = self.cross_grn(cross_map, time_emb)
-        gate = torch.sigmoid(self.gate(query_tokens, time_emb) + self.gate_init_bias)
+        gate = torch.sigmoid(self.gate(query_map, time_emb) + self.gate_init_bias)
 
         state_map = state_tokens.transpose(1, 2).reshape(B, C, height, width)
         state_map = state_map + gate.view(B, C, 1, 1) * self.layer_scale.view(1, C, 1, 1) * cross_map
