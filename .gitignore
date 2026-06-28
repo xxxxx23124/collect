@@ -24,10 +24,65 @@ __pycache__/
 venv/
 env/
 .env
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+# 如果你还想忽略所有Notebook的输出，可以使用 nbstripout 等工具，原.ipynb一般保留
+
+# Data files (本地原始/中间数据)
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.parquet
+*.feather
+*.npz
+*.npy
+*.h5
+*.hdf5
+
+# Image / figure files (图像、图表)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.pdf
+*.svg
+*.eps
+
+# Trained models
+*.pkl
+*.joblib
+*.pickle
+*.pt
+*.pth
+*.onnx
+*.pb
+*.keras
+*.h5   # 若h5同时用于数据和模型，这里再次强调
+*.hdf5
+
+# Model / checkpoint directories
+models/
+checkpoints/
+ckpt/
+weights/
+logs/
+lightning_logs/
+runs/
+wandb/
+mlruns/
 
 # Docker
 .docker/
 
-# Locally generated real data test files
-*.csv
-*.xlsx
+# Other common files
+*.log
+*.out
+.DS_Store
