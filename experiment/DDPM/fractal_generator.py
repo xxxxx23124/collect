@@ -432,6 +432,8 @@ def random_ifs_leaf_params(rng: np.random.Generator, leaf_styles: List[str]) -> 
     if rng.random() < 0.5:
         affines[:, [0, 1, 4]] *= -1.0
 
+    affines = limit_affine_contraction(affines)
+
     probs = np.asarray(config["probs"], dtype=np.float64)
     probs = np.clip(probs + rng.normal(0.0, 0.018, size=probs.shape), 0.004, None)
     probs = probs / probs.sum()
@@ -450,6 +452,16 @@ def random_ifs_leaf_params(rng: np.random.Generator, leaf_styles: List[str]) -> 
         "burn_in": 50,
         "blur_passes": int(rng.integers(1, 3)),
     }
+
+
+def limit_affine_contraction(affines: Array, max_radius: float = 0.98) -> Array:
+    affines = affines.copy()
+    for index in range(affines.shape[0]):
+        matrix = affines[index, :4].reshape((2, 2))
+        radius = float(np.max(np.abs(np.linalg.eigvals(matrix))))
+        if radius > max_radius:
+            affines[index, :4] *= max_radius / radius
+    return affines
 
 
 def random_leaf_palette(rng: np.random.Generator) -> Dict[str, object]:
@@ -549,9 +561,10 @@ def render_ifs_leaf(
     probs = np.asarray(params["probs"], dtype=np.float64)
     probs = probs / probs.sum()
     cumulative = np.cumsum(probs)
+    cumulative[-1] = 1.0
     bounds = np.asarray(params["bounds"], dtype=np.float64)
 
-    hist, angle_acc = _ifs_histogram(
+    hist, angle_sin, angle_cos = _ifs_histogram(
         size,
         affines,
         cumulative,
@@ -569,14 +582,16 @@ def render_ifs_leaf(
     )
 
     hist = hist.astype(np.float64)
-    angle_acc = angle_acc.astype(np.float64)
+    angle_sin = angle_sin.astype(np.float64)
+    angle_cos = angle_cos.astype(np.float64)
     for _ in range(int(params.get("blur_passes", 1))):
         hist = cheap_blur(hist)
-        angle_acc = cheap_blur(angle_acc)
+        angle_sin = cheap_blur(angle_sin)
+        angle_cos = cheap_blur(angle_cos)
 
     value = normalize01(np.log1p(hist))
     density = normalize01(hist)
-    angle = np.where(hist > 0, angle_acc / np.maximum(hist, 1.0), 0.0)
+    angle = np.where(hist > 0, np.arctan2(angle_sin, angle_cos), 0.0)
     detail = normalize01(edge_detail(value) + value * 0.36)
     return {"value": value, "density": density, "angle": angle, "detail": detail}
 
@@ -616,7 +631,8 @@ if njit is not None:
         max_y,
     ):
         hist = np.zeros((size, size), dtype=np.float64)
-        angle_acc = np.zeros((size, size), dtype=np.float64)
+        angle_sin = np.zeros((size, size), dtype=np.float64)
+        angle_cos = np.zeros((size, size), dtype=np.float64)
         state = np.uint64(seed + 1)
         x = 0.0
         y = 0.0
@@ -645,8 +661,10 @@ if njit is not None:
                 py = int((1.0 - vy) * 0.5 * (size - 1))
                 if 0 <= px < size and 0 <= py < size:
                     hist[py, px] += 1.0
-                    angle_acc[py, px] += math.atan2(vy, vx + 1e-12)
-        return hist, angle_acc
+                    theta = math.atan2(vy, vx + 1e-12)
+                    angle_sin[py, px] += math.sin(theta)
+                    angle_cos[py, px] += math.cos(theta)
+        return hist, angle_sin, angle_cos
 
 else:
 
@@ -668,7 +686,8 @@ else:
     ):
         rng = np.random.default_rng(seed)
         hist = np.zeros((size, size), dtype=np.float64)
-        angle_acc = np.zeros((size, size), dtype=np.float64)
+        angle_sin = np.zeros((size, size), dtype=np.float64)
+        angle_cos = np.zeros((size, size), dtype=np.float64)
         x = 0.0
         y = 0.0
         mid_x = (min_x + max_x) * 0.5
@@ -679,6 +698,7 @@ else:
         sin_t = math.sin(rotation)
         for i in range(points + burn_in):
             k = int(np.searchsorted(cumulative, rng.random()))
+            k = min(k, cumulative.shape[0] - 1)
             a, b, c, d, e, f = affines[k]
             x, y = a * x + b * y + e, c * x + d * y + f
             if i >= burn_in:
@@ -692,8 +712,10 @@ else:
                 py = int((1.0 - vy) * 0.5 * (size - 1))
                 if 0 <= px < size and 0 <= py < size:
                     hist[py, px] += 1.0
-                    angle_acc[py, px] += math.atan2(vy, vx + 1e-12)
-        return hist, angle_acc
+                    theta = math.atan2(vy, vx + 1e-12)
+                    angle_sin[py, px] += math.sin(theta)
+                    angle_cos[py, px] += math.cos(theta)
+        return hist, angle_sin, angle_cos
 
 
 def normalize01(values: Array) -> Array:
@@ -815,6 +837,7 @@ def main() -> None:
             metadata = save_result(result, image_dir)
             if metadata_file is not None:
                 metadata_file.write(json.dumps(metadata, ensure_ascii=False, default=_json_default) + "\n")
+                metadata_file.flush()
     finally:
         if metadata_file is not None:
             metadata_file.close()
