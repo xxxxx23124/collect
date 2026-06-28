@@ -299,9 +299,14 @@ def _max_existing_function_id(metadata_path: Path) -> int:
     return max_function_id
 
 
+def _expand_output_path(path: Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(path)))).resolve()
+
+
 def prepare_output(args: argparse.Namespace) -> Tuple[Path, Path, int, int]:
-    image_dir = args.out / "images"
-    metadata_path = args.out / "metadata.jsonl"
+    output_root = _expand_output_path(args.out)
+    image_dir = output_root / "images"
+    metadata_path = output_root / "metadata.jsonl"
 
     if args.overwrite:
         for path in image_dir.glob("fractal_*.png"):
@@ -311,7 +316,7 @@ def prepare_output(args: argparse.Namespace) -> Tuple[Path, Path, int, int]:
 
     image_dir.mkdir(parents=True, exist_ok=True)
     start_index = _max_existing_image_index(image_dir) + 1
-    start_function_id = _max_existing_function_id(metadata_path) + 1
+    start_function_id = _max_existing_function_id(metadata_path) + 1 if args.metadata else 0
     return image_dir, metadata_path, start_index, start_function_id
 
 
@@ -421,7 +426,7 @@ def random_ifs_leaf_params(rng: np.random.Generator, leaf_styles: List[str]) -> 
     affines = affines + rng.normal(0.0, noise, size=affines.shape)
 
     # Keep the stem transform stable while allowing fronds to vary more freely.
-    affines[0, [0, 1, 2, 4]] = 0.0
+    affines[0, [0, 1, 2, 4, 5]] = 0.0
     affines[0, 3] = np.clip(affines[0, 3], 0.10, 0.24)
 
     x_stretch = float(rng.uniform(*config.get("x_stretch", [0.86, 1.18])))
