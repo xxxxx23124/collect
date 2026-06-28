@@ -927,7 +927,6 @@ class CrossFusionBlock(nn.Module):
     def forward(self,
                 cnn_tokens: torch.Tensor,
                 state_tokens: torch.Tensor,
-                cnn_map: torch.Tensor,
                 time_emb: torch.Tensor,
                 height: int,
                 width: int) -> torch.Tensor:
@@ -1014,7 +1013,6 @@ class BottleneckTransformerStage(nn.Module):
                 state_tokens = cross_layer(
                     cnn_tokens=cnn_tokens,
                     state_tokens=state_tokens,
-                    cnn_map=x_feat,
                     time_emb=time_emb_in,
                     height=H,
                     width=W
