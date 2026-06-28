@@ -12,7 +12,8 @@ def main():
     sample_dir = project_dir / "Ver2 image"
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = CatDataset(image_size=64)
+    image_size = 64
+    dataset = CatDataset(image_size=image_size)
     if len(dataset) == 0:
         print("没有找到猫猫头数据，请先检查 CatDataset 里的路径。")
         return
@@ -21,13 +22,16 @@ def main():
         model_cls=DiffusionTransUNet_64,
         dataset=dataset,
         epochs=200,
-        batch_size=28,
-        accumulation_steps=10,
-        lr=1e-4,
+        batch_size=128,
+        accumulation_steps=2,
+        lr=2e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        timesteps=1000,
+        image_size=image_size,
         sample_dir=sample_dir,
         sample_every=1,
-        num_samples=16,
+        num_samples=4,
+        num_workers=4,
         save_model=False,
         use_monitor=False,
     )

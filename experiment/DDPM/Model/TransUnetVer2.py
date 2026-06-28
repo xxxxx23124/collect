@@ -7,31 +7,27 @@ import torch.nn.init as init
 from torch.utils.checkpoint import checkpoint
 
 
-# ================================================
-# 2026/4/20 by Xingqian She
-# ================================================
-
 
 @dataclass
 class TransUNet64Config:
-    time_emb_dim: int = 256
-    time_hidden_dim: int = 512
-    time_layers: int = 5
-    num_experts: int = 4
-    attn_head_dim: int = 64
+    time_emb_dim: int = 128
+    time_hidden_dim: int = 256
+    time_layers: int = 3
+    num_experts: int = 2
+    attn_head_dim: int = 32
     groups: int = 4
-    dense_inc: int = 16
-    stem_channels: int = 64
-    encoder_channels: tuple[int, int, int] = (64, 128, 256)
-    encoder_blocks: tuple[int, int, int] = (3, 3, 4)
-    down_channels: tuple[int, int, int] = (128, 256, 512)
-    bottleneck_inner_channels: int = 1024
-    bottleneck_layers: int = 10
-    bottleneck_heads: int = 16
+    dense_inc: int = 8
+    stem_channels: int = 32
+    encoder_channels: tuple[int, int, int] = (32, 64, 128)
+    encoder_blocks: tuple[int, int, int] = (1, 1, 2)
+    down_channels: tuple[int, int, int] = (64, 128, 256)
+    bottleneck_inner_channels: int = 256
+    bottleneck_layers: int = 2
+    bottleneck_heads: int = 8
     encoder_attn_heads: int = 5
-    decoder_up_channels: tuple[int, int, int] = (256, 192, 96)
-    decoder_channels: tuple[int, int, int] = (384, 192, 96)
-    decoder_blocks: tuple[int, int, int] = (4, 3, 3)
+    decoder_up_channels: tuple[int, int, int] = (128, 96, 48)
+    decoder_channels: tuple[int, int, int] = (192, 96, 48)
+    decoder_blocks: tuple[int, int, int] = (2, 1, 1)
     decoder_attn_heads: int = 7
 
 
@@ -97,6 +93,13 @@ class Factory:
             rope=self.rope
         )
 
+    def get_crossattn(self, channels, num_heads):
+        return CrossAttention(
+            channels=channels,
+            num_heads=num_heads,
+            rope=self.rope
+        )
+
     def get_swiglu(self, channels, inner_channels):
         return TimeAwareSwiGLU(
             channels=channels,
@@ -125,43 +128,50 @@ class RoPE2D(nn.Module):
         half_dim = dim // 2
         quarter_dim = half_dim // 2
         inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim, dtype=torch.float) / quarter_dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-        t_y = torch.arange(height, dtype=torch.float)
+    def _build_freqs(self, height: int, width: int, device: torch.device, dtype: torch.dtype):
+        if height > self.height or width > self.width:
+            raise ValueError(
+                f"RoPE2D cache supports up to {(self.height, self.width)}, got {(height, width)}."
+            )
+
+        half_dim = self.dim // 2
+        inv_freq = self.inv_freq.to(device=device)
+
+        t_y = torch.arange(height, device=device, dtype=inv_freq.dtype)
         freqs_y = torch.einsum('i,j->ij', t_y, inv_freq)
         emb_y = torch.cat((freqs_y, freqs_y), dim=-1)
+        emb_y = emb_y.unsqueeze(1).expand(-1, width, -1).reshape(1, 1, height * width, half_dim)
 
-
-        t_x = torch.arange(width, dtype=torch.float)
+        t_x = torch.arange(width, device=device, dtype=inv_freq.dtype)
         freqs_x = torch.einsum('i,j->ij', t_x, inv_freq)
         emb_x = torch.cat((freqs_x, freqs_x), dim=-1)
+        emb_x = emb_x.unsqueeze(0).expand(height, -1, -1).reshape(1, 1, height * width, half_dim)
 
-        emb_y_grid = emb_y.unsqueeze(1).expand(-1, width, -1)
-
-        emb_x_grid = emb_x.unsqueeze(0).expand(height, -1, -1)
-
-        freqs_y_full = emb_y_grid.reshape(-1, half_dim)
-        freqs_x_full = emb_x_grid.reshape(-1, half_dim)
-
-        self.register_buffer("cos_y_cached", freqs_y_full.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_y_cached", freqs_y_full.sin().unsqueeze(0).unsqueeze(0))
-
-        self.register_buffer("cos_x_cached", freqs_x_full.cos().unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_x_cached", freqs_x_full.sin().unsqueeze(0).unsqueeze(0))
+        return emb_y.cos().to(dtype), emb_y.sin().to(dtype), emb_x.cos().to(dtype), emb_x.sin().to(dtype)
 
     def forward(self,
                 q: torch.Tensor,
                 k: torch.Tensor,
+                height: int | None = None,
+                width: int | None = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         seq_len = q.shape[2]
 
+        if height is None or width is None:
+            side = int(math.sqrt(seq_len))
+            if side * side != seq_len:
+                raise ValueError("RoPE2D needs height and width for non-square sequences.")
+            height = width = side
+
+        if seq_len != height * width:
+            raise ValueError(f"RoPE2D got seq_len={seq_len}, but height*width={height * width}.")
+
+        cos_y, sin_y, cos_x, sin_x = self._build_freqs(height, width, q.device, q.dtype)
+
         def main_path(x_in: torch.Tensor):
             y_part, x_part = x_in.chunk(2, dim=-1)
-
-            cos_y = self.cos_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-            sin_y = self.sin_y_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-
-            cos_x = self.cos_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
-            sin_x = self.sin_x_cached[:, :, :seq_len, :].to(dtype=x_in.dtype)
 
             y_out = y_part * cos_y + self.rotate_half(y_part) * sin_y
             x_out = x_part * cos_x + self.rotate_half(x_part) * sin_x
@@ -256,20 +266,24 @@ class Modulator(nn.Module):
 
 
 class TinyContentEncoder(nn.Module):
-    def __init__(self, in_channels, out_channels=None):
+    def __init__(self, in_channels, out_channels=None, eps=1e-6):
         super().__init__()
         out_channels = out_channels if out_channels is not None else min(64, max(16, in_channels // 4))
-        self.out_channels = out_channels
+        self.feat_channels = out_channels
+        self.out_channels = out_channels * 2
+        self.eps = eps
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
             nn.SiLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
             nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).flatten(1)
+        feat = self.net(x)
+        feat_mean = feat.mean(dim=(2, 3))
+        feat_std = feat.std(dim=(2, 3), unbiased=False) + self.eps
+        return torch.cat([feat_mean, feat_std], dim=1)
 
 
 class ContentAwareModulator(nn.Module):
@@ -514,18 +528,85 @@ class SelfAttention(nn.Module):
 
         self.rope = rope
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                height: int | None = None,
+                width: int | None = None) -> torch.Tensor:
         B, N, C = x.shape
+
+        if height is None or width is None:
+            side = int(math.sqrt(N))
+            if side * side != N:
+                raise ValueError("SelfAttention needs height and width for non-square sequences.")
+            height = width = side
+
+        if N != height * width:
+            raise ValueError(f"SelfAttention got N={N}, but height*width={height * width}.")
 
         qkv = self.to_qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        q, k = self.rope(q, k)
+        q, k = self.rope(q, k, height=height, width=width)
 
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
+        return self.to_out(out)
+
+
+class CrossAttention(nn.Module):
+    def __init__(self,
+                 channels: int,
+                 num_heads: int,
+                 rope: RoPE2D):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = rope.dim
+        self.head_dim = head_dim
+        inner_dim = num_heads * head_dim
+
+        self.to_q = nn.Linear(channels, inner_dim, bias=False)
+        self.to_k = nn.Linear(channels, inner_dim, bias=False)
+        self.to_v = nn.Linear(channels, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, channels, bias=False)
+
+        self.rope = rope
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.zeros_(self.to_out.weight)
+
+    def forward(self,
+                query: torch.Tensor,
+                context: torch.Tensor,
+                height: int | None = None,
+                width: int | None = None) -> torch.Tensor:
+        B, Nq, _ = query.shape
+        _, Nk, _ = context.shape
+
+        if height is None or width is None:
+            side = int(math.sqrt(Nq))
+            if side * side != Nq:
+                raise ValueError("CrossAttention needs height and width for non-square sequences.")
+            height = width = side
+
+        if Nq != height * width or Nk != height * width:
+            raise ValueError(
+                f"CrossAttention got Nq={Nq}, Nk={Nk}, but height*width={height * width}."
+            )
+
+        q = self.to_q(query)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q = q.view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        q, k = self.rope(q, k, height=height, width=width)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, Nq, -1)
         return self.to_out(out)
 
 
@@ -788,7 +869,7 @@ class SpatialSelfAttention(nn.Module):
         residual = x
         x_flat = x.flatten(2).transpose(1, 2).contiguous()  # (B, N, C)
         x_norm = self.rms(x_flat, time_emb)
-        out = self.attn(x_norm)
+        out = self.attn(x_norm, height=H, width=W)
         out = out.transpose(1, 2).reshape(B, C, H, W)
         return residual + out
 
@@ -811,11 +892,59 @@ class TransformerBlock(nn.Module):
         inner_channels = int(channels * ffn_mult)
         self.ffn = factory.get_swiglu(channels=channels, inner_channels=inner_channels)
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                time_emb: torch.Tensor,
+                height: int | None = None,
+                width: int | None = None) -> torch.Tensor:
 
-        x = x + self.attn(self.rms1(x, time_emb))
+        x = x + self.attn(self.rms1(x, time_emb), height=height, width=width)
         x = x + self.ffn(self.rms2(x, time_emb), time_emb)
         return x
+
+
+class CrossFusionBlock(nn.Module):
+    def __init__(self,
+                 channels: int,
+                 num_heads: int,
+                 factory: Factory,
+                 gate_init_bias: float = -2.0):
+        super().__init__()
+        self.q_norm = factory.get_rms(channels=channels)
+        self.kv_norm = factory.get_rms(channels=channels)
+        self.cross_attn = factory.get_crossattn(channels=channels, num_heads=num_heads)
+        self.cross_grn = factory.get_grn(channels=channels)
+        self.gate = ContentAwareModulator(
+            in_channels=channels,
+            time_emb_dim=factory.time_emb_dim,
+            out_channels=channels,
+            hidden_dim=max(64, channels // 4)
+        )
+        self.gate_init_bias = gate_init_bias
+        self.layer_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
+
+    def forward(self,
+                cnn_tokens: torch.Tensor,
+                state_tokens: torch.Tensor,
+                cnn_map: torch.Tensor,
+                time_emb: torch.Tensor,
+                height: int,
+                width: int) -> torch.Tensor:
+        B, N, C = state_tokens.shape
+        cross_tokens = self.cross_attn(
+            self.q_norm(cnn_tokens, time_emb),
+            self.kv_norm(state_tokens, time_emb),
+            height=height,
+            width=width
+        )
+
+        cross_map = cross_tokens.transpose(1, 2).reshape(B, C, height, width)
+        cross_map = self.cross_grn(cross_map, time_emb)
+        gate = torch.sigmoid(self.gate(cnn_map, time_emb) + self.gate_init_bias)
+
+        state_map = state_tokens.transpose(1, 2).reshape(B, C, height, width)
+        state_map = state_map + gate.view(B, C, 1, 1) * self.layer_scale.view(1, C, 1, 1) * cross_map
+        return state_map.flatten(2).transpose(1, 2).contiguous()
 
 
 class BottleneckTransformerStage(nn.Module):
@@ -849,12 +978,17 @@ class BottleneckTransformerStage(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.fusion_act = factory.get_act()
-
-        self.fusion_grn = factory.get_grn(inner_channels * 2)
+        self.cross_layers = nn.ModuleList([
+            CrossFusionBlock(
+                channels=inner_channels,
+                num_heads=num_heads,
+                factory=factory
+            )
+            for _ in range(num_layers)
+        ])
 
         self.proj_out = factory.get_condconv(
-            in_channels=inner_channels * 2,
+            in_channels=inner_channels,
             out_channels=out_channels,
             kernel_size=1,
             stride=1,
@@ -869,15 +1003,23 @@ class BottleneckTransformerStage(nn.Module):
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor) -> torch.Tensor:
             x_feat = self.proj_in(x_in, time_emb_in)
             B, C, H, W = x_feat.shape
-            x_trans = x_feat.flatten(2).transpose(1, 2).contiguous()
-            for layer in self.layers:
-                x_trans = layer(x_trans, time_emb_in)
-            x_trans = x_trans.transpose(1, 2).reshape(B, C, H, W)
-            x_trans = x_trans * self.trans_scale
-            x_combined = torch.cat([x_feat, x_trans], dim=1)
-            x_combined = self.fusion_act(x_combined)
-            x_combined = self.fusion_grn(x_combined, time_emb_in)
-            out = self.proj_out(x_combined, time_emb_in)
+            cnn_tokens = x_feat.flatten(2).transpose(1, 2).contiguous()
+            state_tokens = cnn_tokens
+
+            for layer, cross_layer in zip(self.layers, self.cross_layers):
+                state_tokens = layer(state_tokens, time_emb_in, height=H, width=W)
+                state_tokens = cross_layer(
+                    cnn_tokens=cnn_tokens,
+                    state_tokens=state_tokens,
+                    cnn_map=x_feat,
+                    time_emb=time_emb_in,
+                    height=H,
+                    width=W
+                )
+
+            out = state_tokens.transpose(1, 2).reshape(B, C, H, W)
+            out = x_feat + self.trans_scale * (out - x_feat)
+            out = self.proj_out(out, time_emb_in)
 
             return out
 
@@ -940,7 +1082,7 @@ class DiffusionTransUNet_64(nn.Module):
     def __init__(self,
                  in_channels=3,
                  out_channels=3,
-                 time_emb_dim=256,
+                 time_emb_dim=128,
                  config: TransUNet64Config | None = None):
         super().__init__()
         self.config = config or TransUNet64Config(time_emb_dim=time_emb_dim)

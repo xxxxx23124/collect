@@ -18,19 +18,31 @@ def run_training(
         accumulation_steps=4,  # 累积几步更新一次
         lr=2e-4,
         device="cuda",
+        timesteps=300,
+        image_size=64,
         save_path=None,
         save_model=False,
         sample_dir=".",
         sample_every=1,
         num_samples=16,
+        num_workers=4,
         use_monitor=False,
 ):
     # 1. 初始化模型和 DDPM
     unet = model_cls()
-    ddpm = DDPM(model=unet, timesteps=1000).to(device)
+    ddpm = DDPM(model=unet, timesteps=timesteps).to(device)
 
     # 2. 数据加载器
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        persistent_workers=num_workers > 0,
+    )
 
     # 3. 优化器和调度器
     optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=0)
@@ -49,6 +61,7 @@ def run_training(
     print(f"🚀 Start Training on {device}...")
     print(f"   Batch Size: {batch_size}, Accumulation: {accumulation_steps}")
     print(f"   Effective Batch Size: {batch_size * accumulation_steps}")
+    print(f"   DDPM Timesteps: {timesteps}, Image Size: {image_size}")
 
     for epoch in range(epochs):
         ddpm.train()
@@ -63,7 +76,7 @@ def run_training(
             else:
                 images = batch
 
-            images = images.to(device)
+            images = images.to(device, non_blocking=use_cuda)
 
             # 重要：DDPM 假设输入在 [-1, 1]，如果 DataLoader 输出是 [0, 1]，需要转换
             # images = images * 2.0 - 1.0
@@ -127,7 +140,7 @@ def run_training(
 
         if sample_every > 0 and (epoch + 1) % sample_every == 0:
             print("🎨 Sampling images...")
-            generated_imgs = ddpm.sample(num_samples=num_samples, img_size=64)
+            generated_imgs = ddpm.sample(num_samples=num_samples, img_size=image_size)
             sample_path = sample_dir / f"output_epoch_{epoch + 1}.png"
             save_image(generated_imgs, sample_path, nrow=4)
             print(f"✅ Saved sample to {sample_path}")
