@@ -922,6 +922,7 @@ class CrossFusionBlock(nn.Module):
         )
         self.gate_init_bias = gate_init_bias
         self.layer_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
+        self.query_mix = nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
     def forward(self,
                 cnn_tokens: torch.Tensor,
@@ -931,8 +932,9 @@ class CrossFusionBlock(nn.Module):
                 height: int,
                 width: int) -> torch.Tensor:
         B, N, C = state_tokens.shape
+        query_tokens = cnn_tokens + self.query_mix * (state_tokens - cnn_tokens)
         cross_tokens = self.cross_attn(
-            self.q_norm(cnn_tokens, time_emb),
+            self.q_norm(query_tokens, time_emb),
             self.kv_norm(state_tokens, time_emb),
             height=height,
             width=width
