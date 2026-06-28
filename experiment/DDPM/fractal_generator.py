@@ -21,17 +21,235 @@ except Exception:  # pragma: no cover - fallback for environments without numba
 Array = np.ndarray
 
 IMAGE_NAME_RE = re.compile(r"^fractal_(\d+)\.png$")
+FAMILY = "ifs_leaf"
 
-
-FAMILIES = (
-    "mandelbrot",
-    "burning_ship",
-    "tricorn",
-    "julia",
-    "newton",
-    "ifs_leaf",
-    "flame",
-)
+LEAF_STYLES = {
+    "classic_fern": {
+        "category": "fern",
+        "affines": [[0.0, 0.0, 0.0, 0.16, 0.0, 0.0], [0.85, 0.04, -0.04, 0.85, 0.0, 1.60], [0.20, -0.26, 0.23, 0.22, 0.0, 1.60], [-0.15, 0.28, 0.26, 0.24, 0.0, 0.44]],
+        "probs": [0.01, 0.78, 0.105, 0.105],
+        "bounds": [-3.0, 3.0, 0.0, 10.5],
+        "noise": [0.020, 0.028, 0.028, 0.020, 0.055, 0.090],
+        "x_stretch": [0.86, 1.18],
+        "y_step": [0.92, 1.08],
+    },
+    "soft_fern": {
+        "category": "fern",
+        "affines": [[0.0, 0.0, 0.0, 0.17, 0.0, 0.0], [0.84, 0.02, -0.02, 0.86, 0.0, 1.50], [0.18, -0.22, 0.20, 0.23, 0.0, 1.45], [-0.14, 0.24, 0.22, 0.22, 0.0, 0.55]],
+        "probs": [0.012, 0.80, 0.095, 0.093],
+        "bounds": [-2.8, 2.8, 0.0, 10.6],
+        "noise": [0.018, 0.024, 0.024, 0.020, 0.050, 0.080],
+        "x_stretch": [0.90, 1.12],
+        "y_step": [0.94, 1.08],
+    },
+    "dense_fern": {
+        "category": "fern",
+        "affines": [[0.0, 0.0, 0.0, 0.13, 0.0, 0.0], [0.80, 0.05, -0.05, 0.84, 0.0, 1.30], [0.25, -0.34, 0.28, 0.22, 0.0, 1.35], [-0.22, 0.32, 0.28, 0.24, 0.0, 0.48]],
+        "probs": [0.010, 0.70, 0.145, 0.145],
+        "bounds": [-3.8, 3.8, 0.0, 9.8],
+        "noise": [0.024, 0.032, 0.032, 0.024, 0.065, 0.090],
+        "x_stretch": [0.94, 1.24],
+        "y_step": [0.90, 1.05],
+    },
+    "sparse_fern": {
+        "category": "fern",
+        "affines": [[0.0, 0.0, 0.0, 0.18, 0.0, 0.0], [0.88, 0.03, -0.03, 0.87, 0.0, 1.70], [0.16, -0.30, 0.20, 0.20, 0.0, 1.75], [-0.12, 0.30, 0.20, 0.22, 0.0, 0.60]],
+        "probs": [0.014, 0.84, 0.074, 0.072],
+        "bounds": [-2.9, 2.9, 0.0, 12.0],
+        "noise": [0.018, 0.030, 0.030, 0.020, 0.055, 0.105],
+        "x_stretch": [0.84, 1.08],
+        "y_step": [0.96, 1.12],
+    },
+    "wide_frond": {
+        "category": "fern",
+        "affines": [[0.0, 0.0, 0.0, 0.14, 0.0, 0.0], [0.80, 0.06, -0.04, 0.82, 0.0, 1.30], [0.28, -0.36, 0.32, 0.24, 0.0, 1.45], [-0.24, 0.34, 0.30, 0.26, 0.0, 0.55]],
+        "probs": [0.012, 0.73, 0.13, 0.128],
+        "bounds": [-4.0, 4.0, 0.0, 9.5],
+        "noise": [0.026, 0.034, 0.034, 0.026, 0.075, 0.100],
+        "x_stretch": [1.00, 1.30],
+        "y_step": [0.88, 1.04],
+    },
+    "slender_leaf": {
+        "category": "single_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.20, 0.0, 0.0], [0.90, 0.02, -0.02, 0.88, 0.0, 1.35], [0.12, -0.18, 0.18, 0.18, 0.0, 1.20], [-0.10, 0.18, 0.16, 0.20, 0.0, 0.70]],
+        "probs": [0.015, 0.82, 0.085, 0.080],
+        "bounds": [-2.2, 2.2, 0.0, 12.0],
+        "noise": [0.014, 0.020, 0.020, 0.018, 0.045, 0.075],
+        "x_stretch": [0.70, 0.98],
+        "y_step": [0.98, 1.16],
+    },
+    "lanceolate_leaf": {
+        "category": "single_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.19, 0.0, 0.0], [0.88, 0.01, -0.01, 0.89, 0.0, 1.22], [0.16, -0.16, 0.18, 0.20, 0.0, 1.10], [-0.14, 0.16, 0.18, 0.20, 0.0, 0.82]],
+        "probs": [0.012, 0.81, 0.090, 0.088],
+        "bounds": [-2.4, 2.4, 0.0, 11.6],
+        "noise": [0.014, 0.018, 0.018, 0.018, 0.040, 0.070],
+        "x_stretch": [0.78, 1.05],
+        "y_step": [0.96, 1.12],
+    },
+    "oval_leaf": {
+        "category": "single_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.16, 0.0, 0.0], [0.78, 0.00, 0.00, 0.78, 0.0, 1.18], [0.25, -0.18, 0.24, 0.24, 0.0, 1.08], [-0.25, 0.18, 0.24, 0.24, 0.0, 1.08]],
+        "probs": [0.012, 0.70, 0.144, 0.144],
+        "bounds": [-3.6, 3.6, 0.0, 8.8],
+        "noise": [0.018, 0.018, 0.018, 0.020, 0.060, 0.070],
+        "x_stretch": [1.04, 1.36],
+        "y_step": [0.86, 1.00],
+    },
+    "round_leaf": {
+        "category": "single_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.14, 0.0, 0.0], [0.74, 0.00, 0.00, 0.74, 0.0, 1.08], [0.28, -0.16, 0.25, 0.23, 0.0, 0.98], [-0.28, 0.16, 0.25, 0.23, 0.0, 0.98]],
+        "probs": [0.012, 0.66, 0.164, 0.164],
+        "bounds": [-3.9, 3.9, 0.0, 8.0],
+        "noise": [0.018, 0.016, 0.016, 0.020, 0.070, 0.060],
+        "x_stretch": [1.16, 1.48],
+        "y_step": [0.78, 0.94],
+    },
+    "heart_leaf": {
+        "category": "single_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.15, 0.0, 0.0], [0.76, -0.03, 0.03, 0.76, 0.0, 1.10], [0.30, -0.20, 0.26, 0.22, 0.0, 1.05], [-0.30, 0.20, 0.26, 0.22, 0.0, 1.05]],
+        "probs": [0.012, 0.64, 0.174, 0.174],
+        "bounds": [-4.0, 4.0, 0.0, 8.2],
+        "noise": [0.018, 0.020, 0.020, 0.020, 0.075, 0.070],
+        "x_stretch": [1.18, 1.52],
+        "y_step": [0.78, 0.96],
+    },
+    "split_leaf": {
+        "category": "split_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.15, 0.0, 0.0], [0.83, 0.00, 0.00, 0.84, 0.0, 1.42], [0.24, -0.31, 0.30, 0.20, 0.0, 1.34], [-0.24, 0.31, 0.30, 0.20, 0.0, 1.34]],
+        "probs": [0.014, 0.74, 0.123, 0.123],
+        "bounds": [-3.7, 3.7, 0.0, 10.2],
+        "noise": [0.022, 0.026, 0.026, 0.020, 0.070, 0.085],
+        "x_stretch": [0.96, 1.24],
+        "y_step": [0.90, 1.08],
+    },
+    "maple_like": {
+        "category": "split_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.13, 0.0, 0.0], [0.74, 0.00, 0.00, 0.78, 0.0, 1.18], [0.34, -0.42, 0.36, 0.20, 0.0, 1.20], [-0.34, 0.42, 0.36, 0.20, 0.0, 1.20]],
+        "probs": [0.012, 0.56, 0.214, 0.214],
+        "bounds": [-4.6, 4.6, 0.0, 8.8],
+        "noise": [0.020, 0.034, 0.034, 0.024, 0.090, 0.075],
+        "x_stretch": [1.15, 1.55],
+        "y_step": [0.82, 1.00],
+    },
+    "palmate_leaf": {
+        "category": "split_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.14, 0.0, 0.0], [0.72, 0.02, -0.02, 0.76, 0.0, 1.05], [0.36, -0.36, 0.32, 0.22, 0.0, 1.10], [-0.36, 0.36, 0.32, 0.22, 0.0, 1.10]],
+        "probs": [0.012, 0.58, 0.204, 0.204],
+        "bounds": [-4.7, 4.7, 0.0, 8.3],
+        "noise": [0.020, 0.032, 0.032, 0.024, 0.090, 0.070],
+        "x_stretch": [1.18, 1.56],
+        "y_step": [0.78, 0.98],
+    },
+    "lobed_leaf": {
+        "category": "split_leaf",
+        "affines": [[0.0, 0.0, 0.0, 0.15, 0.0, 0.0], [0.78, 0.04, -0.03, 0.79, 0.0, 1.20], [0.30, -0.28, 0.27, 0.23, 0.0, 1.08], [-0.30, 0.28, 0.27, 0.23, 0.0, 0.82]],
+        "probs": [0.012, 0.64, 0.176, 0.172],
+        "bounds": [-4.2, 4.2, 0.0, 8.8],
+        "noise": [0.020, 0.030, 0.030, 0.024, 0.085, 0.075],
+        "x_stretch": [1.08, 1.42],
+        "y_step": [0.82, 1.02],
+    },
+    "grass_blade": {
+        "category": "grass",
+        "affines": [[0.0, 0.0, 0.0, 0.22, 0.0, 0.0], [0.93, 0.03, -0.05, 0.91, 0.0, 1.10], [0.07, -0.10, 0.12, 0.16, 0.0, 0.95], [-0.06, 0.10, 0.10, 0.17, 0.0, 0.58]],
+        "probs": [0.018, 0.88, 0.052, 0.050],
+        "bounds": [-1.5, 1.5, 0.0, 13.2],
+        "noise": [0.012, 0.018, 0.020, 0.018, 0.030, 0.065],
+        "x_stretch": [0.42, 0.72],
+        "y_step": [1.02, 1.18],
+    },
+    "reed_leaf": {
+        "category": "grass",
+        "affines": [[0.0, 0.0, 0.0, 0.21, 0.0, 0.0], [0.91, 0.06, -0.03, 0.90, 0.0, 1.22], [0.10, -0.12, 0.13, 0.17, 0.0, 1.00], [-0.08, 0.12, 0.12, 0.18, 0.0, 0.70]],
+        "probs": [0.016, 0.86, 0.064, 0.060],
+        "bounds": [-1.8, 1.8, 0.0, 13.0],
+        "noise": [0.014, 0.022, 0.020, 0.018, 0.036, 0.070],
+        "x_stretch": [0.50, 0.82],
+        "y_step": [1.00, 1.16],
+    },
+    "curved_blade": {
+        "category": "grass",
+        "affines": [[0.0, 0.0, 0.0, 0.20, 0.0, 0.0], [0.90, 0.11, -0.08, 0.90, 0.0, 1.18], [0.09, -0.14, 0.13, 0.16, 0.0, 1.00], [-0.07, 0.13, 0.11, 0.17, 0.0, 0.64]],
+        "probs": [0.016, 0.86, 0.064, 0.060],
+        "bounds": [-2.1, 2.1, 0.0, 13.0],
+        "noise": [0.014, 0.026, 0.026, 0.018, 0.042, 0.070],
+        "x_stretch": [0.52, 0.86],
+        "y_step": [1.00, 1.15],
+    },
+    "compound_leaf": {
+        "category": "compound",
+        "affines": [[0.0, 0.0, 0.0, 0.16, 0.0, 0.0], [0.84, 0.02, -0.02, 0.84, 0.0, 1.36], [0.18, -0.28, 0.24, 0.20, 0.0, 1.22], [-0.18, 0.28, 0.24, 0.20, 0.0, 0.86]],
+        "probs": [0.012, 0.76, 0.114, 0.114],
+        "bounds": [-3.3, 3.3, 0.0, 10.6],
+        "noise": [0.020, 0.030, 0.030, 0.022, 0.065, 0.080],
+        "x_stretch": [0.92, 1.20],
+        "y_step": [0.92, 1.10],
+    },
+    "branching_leaf": {
+        "category": "compound",
+        "affines": [[0.0, 0.0, 0.0, 0.16, 0.0, 0.0], [0.82, 0.08, -0.06, 0.83, 0.0, 1.36], [0.20, -0.32, 0.26, 0.22, 0.0, 1.28], [-0.14, 0.34, 0.24, 0.22, 0.0, 0.70]],
+        "probs": [0.012, 0.74, 0.132, 0.116],
+        "bounds": [-3.7, 3.7, 0.0, 10.4],
+        "noise": [0.022, 0.034, 0.034, 0.022, 0.075, 0.085],
+        "x_stretch": [0.94, 1.28],
+        "y_step": [0.90, 1.08],
+    },
+    "asymmetric_sprig": {
+        "category": "compound",
+        "affines": [[0.0, 0.0, 0.0, 0.17, 0.0, 0.0], [0.84, 0.07, -0.04, 0.84, 0.0, 1.42], [0.22, -0.30, 0.26, 0.20, 0.0, 1.30], [-0.10, 0.24, 0.20, 0.21, 0.0, 0.56]],
+        "probs": [0.012, 0.78, 0.142, 0.066],
+        "bounds": [-3.4, 3.4, 0.0, 10.8],
+        "noise": [0.020, 0.034, 0.030, 0.022, 0.075, 0.085],
+        "x_stretch": [0.92, 1.26],
+        "y_step": [0.92, 1.10],
+    },
+    "ginkgo_like": {
+        "category": "fan",
+        "affines": [[0.0, 0.0, 0.0, 0.13, 0.0, 0.0], [0.68, 0.00, 0.00, 0.72, 0.0, 0.98], [0.38, -0.20, 0.24, 0.20, 0.0, 0.92], [-0.38, 0.20, 0.24, 0.20, 0.0, 0.92]],
+        "probs": [0.012, 0.52, 0.234, 0.234],
+        "bounds": [-5.0, 5.0, 0.0, 7.4],
+        "noise": [0.018, 0.024, 0.024, 0.022, 0.095, 0.060],
+        "x_stretch": [1.30, 1.75],
+        "y_step": [0.72, 0.90],
+    },
+    "fan_leaf": {
+        "category": "fan",
+        "affines": [[0.0, 0.0, 0.0, 0.12, 0.0, 0.0], [0.66, 0.02, -0.02, 0.70, 0.0, 0.92], [0.40, -0.24, 0.25, 0.18, 0.0, 0.88], [-0.40, 0.24, 0.25, 0.18, 0.0, 0.88]],
+        "probs": [0.012, 0.50, 0.244, 0.244],
+        "bounds": [-5.2, 5.2, 0.0, 7.0],
+        "noise": [0.018, 0.026, 0.026, 0.022, 0.100, 0.058],
+        "x_stretch": [1.34, 1.82],
+        "y_step": [0.70, 0.90],
+    },
+    "drooping_leaf": {
+        "category": "special",
+        "affines": [[0.0, 0.0, 0.0, 0.18, 0.0, 0.0], [0.86, -0.08, 0.06, 0.86, 0.0, 1.34], [0.16, -0.22, 0.20, 0.20, 0.0, 1.12], [-0.14, 0.20, 0.18, 0.21, 0.0, 0.68]],
+        "probs": [0.014, 0.82, 0.086, 0.080],
+        "bounds": [-2.8, 2.8, 0.0, 11.5],
+        "noise": [0.018, 0.026, 0.026, 0.020, 0.060, 0.080],
+        "x_stretch": [0.78, 1.08],
+        "y_step": [0.96, 1.14],
+    },
+    "twisted_leaf": {
+        "category": "special",
+        "affines": [[0.0, 0.0, 0.0, 0.17, 0.0, 0.0], [0.84, 0.12, -0.10, 0.84, 0.0, 1.40], [0.18, -0.28, 0.26, 0.22, 0.0, 1.22], [-0.16, 0.30, 0.24, 0.22, 0.0, 0.66]],
+        "probs": [0.012, 0.78, 0.108, 0.100],
+        "bounds": [-3.3, 3.3, 0.0, 10.8],
+        "noise": [0.020, 0.036, 0.036, 0.022, 0.070, 0.085],
+        "x_stretch": [0.88, 1.20],
+        "y_step": [0.92, 1.10],
+    },
+    "curved_stem": {
+        "category": "special",
+        "affines": [[0.0, 0.0, 0.0, 0.17, 0.0, 0.0], [0.82, 0.10, -0.08, 0.84, 0.0, 1.48], [0.18, -0.30, 0.24, 0.23, 0.0, 1.46], [-0.13, 0.32, 0.25, 0.24, 0.0, 0.52]],
+        "probs": [0.012, 0.77, 0.11, 0.108],
+        "bounds": [-3.4, 3.4, 0.0, 10.8],
+        "noise": [0.020, 0.032, 0.032, 0.022, 0.060, 0.095],
+        "x_stretch": [0.90, 1.22],
+        "y_step": [0.90, 1.10],
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -40,7 +258,6 @@ class RenderTask:
     function_id: int
     seed: int
     size: int
-    family: str
     params: Dict[str, object]
 
 
@@ -107,19 +324,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--samples-per-function must be positive")
     if args.workers <= 0:
         raise ValueError("--workers must be positive")
-    if not args.families:
-        raise ValueError("--families must include at least one family")
+    if not args.leaf_styles:
+        raise ValueError("--leaf-styles must include at least one style")
+    unknown_styles = sorted(set(args.leaf_styles) - set(LEAF_STYLES))
+    if unknown_styles:
+        raise ValueError(f"Unknown --leaf-styles: {', '.join(unknown_styles)}")
 
 
-def warn_if_slow_path(args: argparse.Namespace) -> None:
-    point_families = {"ifs_leaf", "flame"}
-    if njit is None and point_families.intersection(args.families):
-        print("Warning: numba is not available; ifs_leaf/flame generation will be much slower.")
+def warn_if_slow_path() -> None:
+    if njit is None:
+        print("Warning: numba is not available; leaf generation will be much slower.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate diverse 512x512 fractal PNG images for DDPM training."
+        description="Generate leaf-like IFS fractal PNG images for DDPM training."
     )
     parser.add_argument("--count", type=int, default=16, help="Number of images to generate.")
     parser.add_argument("--size", type=int, default=512, help="Square image size in pixels.")
@@ -134,14 +353,14 @@ def parse_args() -> argparse.Namespace:
         "--samples-per-function",
         type=int,
         default=3,
-        help="How many random viewports to sample from one generated function.",
+        help="How many random crops/colors to sample from one generated leaf function.",
     )
     parser.add_argument(
-        "--families",
+        "--leaf-styles",
         nargs="*",
-        choices=FAMILIES,
-        default=list(FAMILIES),
-        help="Fractal families to use. Defaults to all families.",
+        choices=sorted(LEAF_STYLES),
+        default=sorted(LEAF_STYLES),
+        help="Leaf style presets to sample. Defaults to all styles.",
     )
     parser.add_argument(
         "--workers",
@@ -174,344 +393,183 @@ def make_tasks(
 
     samples_per_function = max(1, args.samples_per_function)
     function_count = math.ceil(args.count / samples_per_function)
+    leaf_styles = list(args.leaf_styles)
     for function_id in range(function_count):
-        family = str(rng.choice(args.families))
-        params = random_family_params(rng, family)
+        leaf_params = random_ifs_leaf_params(rng, leaf_styles)
         for _ in range(samples_per_function):
             if len(tasks) >= args.count:
                 break
+            params = dict(leaf_params)
+            params["palette"] = random_leaf_palette(rng)
             tasks.append(
                 RenderTask(
                     index=start_index + len(tasks),
                     function_id=start_function_id + function_id,
                     seed=int(rng.integers(0, 2**31 - 1)),
                     size=args.size,
-                    family=family,
                     params=params,
                 )
             )
     return tasks
 
 
-def random_family_params(rng: np.random.Generator, family: str) -> Dict[str, object]:
-    palette = {
-        "hue": float(rng.random()),
-        "hue_scale": float(rng.uniform(0.35, 1.6)),
-        "angle_mix": float(rng.uniform(-0.35, 0.35)),
-        "sat": float(rng.uniform(0.58, 0.95)),
-        "val": float(rng.uniform(0.75, 1.08)),
-        "contrast": float(rng.uniform(0.85, 1.35)),
-        "gamma": float(rng.uniform(0.75, 1.35)),
-        "background": float(rng.uniform(0.0, 0.08)),
-    }
+def random_ifs_leaf_params(rng: np.random.Generator, leaf_styles: List[str]) -> Dict[str, object]:
+    style = str(rng.choice(leaf_styles))
+    config = LEAF_STYLES[style]
+    affines = np.asarray(config["affines"], dtype=np.float64)
+    noise = np.asarray(config["noise"], dtype=np.float64)
+    affines = affines + rng.normal(0.0, noise, size=affines.shape)
 
-    params: Dict[str, object] = {"palette": palette}
-    if family in {"mandelbrot", "burning_ship", "tricorn"}:
-        params.update(
-            {
-                "max_iter": int(rng.integers(120, 420)),
-                "power": int(rng.choice([2, 2, 2, 3, 4])),
-                "bailout": float(rng.uniform(6.0, 24.0)),
-                "jitter": float(rng.uniform(0.0, 0.035)),
-                "trap": [float(rng.uniform(-0.8, 0.8)), float(rng.uniform(-0.8, 0.8))],
-            }
-        )
-    elif family == "julia":
-        angle = rng.uniform(0.0, 2.0 * math.pi)
-        radius = rng.uniform(0.45, 0.86)
-        params.update(
-            {
-                "c": [float(radius * math.cos(angle)), float(radius * math.sin(angle))],
-                "max_iter": int(rng.integers(120, 440)),
-                "power": int(rng.choice([2, 2, 2, 3, 4])),
-                "bailout": float(rng.uniform(6.0, 24.0)),
-                "trap": [float(rng.uniform(-0.6, 0.6)), float(rng.uniform(-0.6, 0.6))],
-            }
-        )
-    elif family == "newton":
-        degree = int(rng.integers(3, 7))
-        angles = np.linspace(0.0, 2.0 * math.pi, degree, endpoint=False)
-        angles += rng.uniform(-0.35, 0.35, size=degree)
-        radii = rng.uniform(0.65, 1.3, size=degree)
-        roots = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
-        params.update(
-            {
-                "roots": roots.tolist(),
-                "max_iter": int(rng.integers(36, 90)),
-                "relaxation": float(rng.uniform(0.78, 1.18)),
-            }
-        )
-    elif family == "ifs_leaf":
-        params.update(random_ifs_leaf_params(rng))
-    elif family == "flame":
-        params.update(random_flame_params(rng))
-    else:
-        raise ValueError(f"Unknown family: {family}")
-    return params
+    # Keep the stem transform stable while allowing fronds to vary more freely.
+    affines[0, [0, 1, 2, 4]] = 0.0
+    affines[0, 3] = np.clip(affines[0, 3], 0.10, 0.24)
 
+    x_stretch = float(rng.uniform(*config.get("x_stretch", [0.86, 1.18])))
+    y_step = float(rng.uniform(*config.get("y_step", [0.92, 1.08])))
+    affines[:, [0, 1, 4]] *= x_stretch
+    affines[:, 5] *= y_step
 
-def random_ifs_leaf_params(rng: np.random.Generator) -> Dict[str, object]:
-    # Barnsley-like presets are perturbed so the generator keeps a leaf/plant bias
-    # while still producing many silhouettes.
-    base = np.array(
-        [
-            [0.0, 0.0, 0.0, 0.16, 0.0, 0.0],
-            [0.85, 0.04, -0.04, 0.85, 0.0, 1.6],
-            [0.2, -0.26, 0.23, 0.22, 0.0, 1.6],
-            [-0.15, 0.28, 0.26, 0.24, 0.0, 0.44],
-        ],
-        dtype=np.float64,
-    )
-    noise = rng.normal(0.0, [0.025, 0.03, 0.03, 0.025, 0.08, 0.12], size=base.shape)
-    affines = base + noise
-    probs = np.array([0.01, 0.78, 0.105, 0.105], dtype=np.float64)
-    probs = probs + rng.normal(0.0, 0.025, size=4)
-    probs = np.clip(probs, 0.005, None)
+    if rng.random() < 0.5:
+        affines[:, [0, 1, 4]] *= -1.0
+
+    probs = np.asarray(config["probs"], dtype=np.float64)
+    probs = np.clip(probs + rng.normal(0.0, 0.018, size=probs.shape), 0.004, None)
     probs = probs / probs.sum()
+
+    bounds = np.asarray(config["bounds"], dtype=np.float64)
+    bounds[[0, 1]] *= max(1.0, x_stretch) * 1.08
+    bounds[3] *= max(1.0, y_step) * 1.04
+
     return {
+        "leaf_style": style,
+        "leaf_category": config["category"],
         "affines": affines.tolist(),
         "probs": probs.tolist(),
-        "points": int(rng.integers(420_000, 900_000)),
-        "burn_in": 40,
+        "bounds": bounds.tolist(),
+        "points": int(rng.integers(520_000, 1_050_000)),
+        "burn_in": 50,
         "blur_passes": int(rng.integers(1, 3)),
     }
 
 
-def random_flame_params(rng: np.random.Generator) -> Dict[str, object]:
-    transform_count = int(rng.integers(3, 7))
-    affines = []
-    for _ in range(transform_count):
-        angle = rng.uniform(0.0, 2.0 * math.pi)
-        scale = rng.uniform(0.25, 0.82)
-        shear = rng.uniform(-0.28, 0.28)
-        cos_a = math.cos(angle) * scale
-        sin_a = math.sin(angle) * scale
-        affines.append(
-            [
-                cos_a + shear,
-                -sin_a,
-                sin_a,
-                cos_a - shear,
-                rng.uniform(-0.8, 0.8),
-                rng.uniform(-0.8, 0.8),
-            ]
-        )
-    variation_weights = rng.dirichlet(np.ones(7) * rng.uniform(0.25, 1.5))
-    probs = rng.dirichlet(np.ones(transform_count))
-    return {
-        "affines": affines,
-        "probs": probs.tolist(),
-        "variation_weights": variation_weights.tolist(),
-        "points": int(rng.integers(650_000, 1_350_000)),
-        "burn_in": 80,
-        "blur_passes": int(rng.integers(1, 3)),
+def random_leaf_palette(rng: np.random.Generator) -> Dict[str, object]:
+    palettes = {
+        "deep_green": {
+            "background": [0.015, 0.020, 0.014],
+            "shadow": [0.025, 0.105, 0.045],
+            "mid": [0.120, 0.430, 0.160],
+            "highlight": [0.720, 0.900, 0.340],
+            "accent": [0.950, 0.720, 0.280],
+        },
+        "moss_mint": {
+            "background": [0.025, 0.040, 0.035],
+            "shadow": [0.045, 0.160, 0.120],
+            "mid": [0.210, 0.580, 0.390],
+            "highlight": [0.760, 0.970, 0.700],
+            "accent": [0.520, 0.900, 0.820],
+        },
+        "blue_green": {
+            "background": [0.018, 0.024, 0.040],
+            "shadow": [0.025, 0.120, 0.160],
+            "mid": [0.080, 0.430, 0.460],
+            "highlight": [0.500, 0.900, 0.760],
+            "accent": [0.340, 0.700, 0.980],
+        },
+        "autumn_leaf": {
+            "background": [0.035, 0.024, 0.018],
+            "shadow": [0.160, 0.065, 0.025],
+            "mid": [0.660, 0.260, 0.070],
+            "highlight": [0.980, 0.770, 0.230],
+            "accent": [0.900, 0.260, 0.180],
+        },
+        "soft_illustration": {
+            "background": [0.840, 0.820, 0.760],
+            "shadow": [0.170, 0.270, 0.140],
+            "mid": [0.360, 0.610, 0.250],
+            "highlight": [0.900, 0.890, 0.520],
+            "accent": [0.700, 0.380, 0.580],
+        },
     }
 
+    name = str(rng.choice(list(palettes)))
+    palette = dict(palettes[name])
+    for key in ("background", "shadow", "mid", "highlight", "accent"):
+        color = np.asarray(palette[key], dtype=np.float64)
+        color += rng.normal(0.0, 0.025, size=3)
+        palette[key] = np.clip(color, 0.0, 1.0).tolist()
 
-def random_viewport(rng: np.random.Generator, family: str) -> Dict[str, float]:
-    if family == "burning_ship":
-        center_x = rng.uniform(-1.85, -1.35)
-        center_y = rng.uniform(-0.18, 0.12)
-        scale = 10.0 ** rng.uniform(-0.45, 0.25)
-    elif family == "mandelbrot":
-        center_x = rng.uniform(-0.9, 0.35)
-        center_y = rng.uniform(-0.65, 0.65)
-        scale = 10.0 ** rng.uniform(-0.62, 0.23)
-    elif family == "tricorn":
-        center_x = rng.uniform(-0.45, 0.45)
-        center_y = rng.uniform(-0.75, 0.75)
-        scale = 10.0 ** rng.uniform(-0.55, 0.22)
-    elif family == "newton":
-        center_x = rng.uniform(-0.2, 0.2)
-        center_y = rng.uniform(-0.2, 0.2)
-        scale = 10.0 ** rng.uniform(-0.18, 0.22)
-    else:
-        center_x = rng.uniform(-0.35, 0.35)
-        center_y = rng.uniform(-0.35, 0.35)
-        scale = 10.0 ** rng.uniform(-0.25, 0.25)
+    palette.update(
+        {
+            "name": name,
+            "contrast": float(rng.uniform(0.90, 1.30)),
+            "gamma": float(rng.uniform(0.72, 1.18)),
+            "vein_strength": float(rng.uniform(0.18, 0.48)),
+            "grain": float(rng.uniform(0.0, 0.018)),
+        }
+    )
+    return palette
+
+
+def random_leaf_viewport(rng: np.random.Generator) -> Dict[str, float]:
     return {
-        "center_x": float(center_x),
-        "center_y": float(center_y),
-        "scale": float(scale),
+        "center_x": float(rng.uniform(-0.08, 0.08)),
+        "center_y": float(rng.uniform(-0.08, 0.10)),
+        "scale": float(10.0 ** rng.uniform(-0.10, 0.10)),
         "rotation": float(rng.uniform(0.0, 2.0 * math.pi)),
     }
 
 
 def render_task(task: RenderTask) -> Tuple[int, Array, Dict[str, object]]:
     rng = np.random.default_rng(task.seed)
-    viewport = random_viewport(rng, task.family)
-    palette = dict(task.params["palette"])
-
-    if task.family in {"mandelbrot", "burning_ship", "tricorn", "julia"}:
-        features = render_escape_time(task.family, task.size, task.params, viewport, rng)
-    elif task.family == "newton":
-        features = render_newton(task.size, task.params, viewport, rng)
-    elif task.family == "ifs_leaf":
-        features = render_point_fractal(task.size, task.params, viewport, task.seed, leaf_mode=True)
-    elif task.family == "flame":
-        features = render_point_fractal(task.size, task.params, viewport, task.seed, leaf_mode=False)
-    else:
-        raise ValueError(f"Unknown family: {task.family}")
-
-    image = unified_color(features, palette, rng)
+    viewport = random_leaf_viewport(rng)
+    features = render_ifs_leaf(task.size, task.params, viewport, task.seed)
+    image = colorize_leaf(features, dict(task.params["palette"]), rng)
     metadata = {
         "index": task.index,
         "filename": f"fractal_{task.index:06d}.png",
         "seed": task.seed,
         "function_id": task.function_id,
-        "family": task.family,
+        "family": FAMILY,
+        "leaf_style": task.params["leaf_style"],
+        "leaf_category": task.params["leaf_category"],
+        "palette": task.params["palette"],
         "viewport": viewport,
-        "params": task.params,
+        "params": {key: value for key, value in task.params.items() if key != "palette"},
     }
     return task.index, image, metadata
 
 
-def complex_grid(size: int, viewport: Dict[str, float]) -> Array:
-    axis = np.linspace(-1.0, 1.0, size, dtype=np.float64)
-    x, y = np.meshgrid(axis, axis)
-    scale = float(viewport["scale"])
-    theta = float(viewport["rotation"])
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    xr = (x * cos_t - y * sin_t) * scale + float(viewport["center_x"])
-    yr = (x * sin_t + y * cos_t) * scale + float(viewport["center_y"])
-    return xr + 1j * yr
-
-
-def render_escape_time(
-    family: str,
-    size: int,
-    params: Dict[str, object],
-    viewport: Dict[str, float],
-    rng: np.random.Generator,
-) -> Dict[str, Array]:
-    grid = complex_grid(size, viewport)
-    max_iter = int(params["max_iter"])
-    power = int(params["power"])
-    bailout = float(params["bailout"])
-    trap_c = complex(*params["trap"])
-
-    if family == "julia":
-        z = grid.copy()
-        c = complex(*params["c"])
-        c_grid = np.full_like(grid, c)
-    else:
-        z = np.zeros_like(grid)
-        c_grid = grid
-
-    escape_iter = np.full(grid.shape, max_iter, dtype=np.float64)
-    trap = np.full(grid.shape, 1e9, dtype=np.float64)
-    final_abs = np.zeros(grid.shape, dtype=np.float64)
-
-    for i in range(max_iter):
-        active = escape_iter == max_iter
-        if not np.any(active):
-            break
-        za = z[active]
-        ca = c_grid[active]
-        if family == "burning_ship":
-            za = np.abs(za.real) + 1j * np.abs(za.imag)
-            zn = za**power + ca
-        elif family == "tricorn":
-            zn = np.conj(za) ** power + ca
-        else:
-            zn = za**power + ca
-        z[active] = zn
-        trap[active] = np.minimum(trap[active], np.abs(zn - trap_c))
-        escaped_now = active & (np.abs(z) > bailout)
-        escape_iter[escaped_now] = i + 1
-        final_abs[escaped_now] = np.abs(z[escaped_now])
-
-    active = escape_iter == max_iter
-    final_abs[active] = np.abs(z[active])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        smooth = escape_iter + 1.0 - np.log(np.log(np.maximum(final_abs, 1.000001))) / math.log(max(power, 2))
-    escaped = escape_iter < max_iter
-    value = np.where(escaped, smooth / max_iter, 0.0)
-    value = normalize01(value)
-    trap_value = np.exp(-3.0 * np.clip(trap, 0.0, 4.0))
-    detail = normalize01(trap_value + edge_detail(value) * 0.65)
-    density = normalize01(np.where(escaped, 1.0 - escape_iter / max_iter, trap_value))
-    angle = np.angle(z)
-
-    if float(params.get("jitter", 0.0)) > 0.0:
-        detail = normalize01(detail + rng.normal(0.0, float(params["jitter"]), size=detail.shape))
-
-    return {"value": value, "density": density, "angle": angle, "detail": detail}
-
-
-def render_newton(
-    size: int,
-    params: Dict[str, object],
-    viewport: Dict[str, float],
-    rng: np.random.Generator,
-) -> Dict[str, Array]:
-    z = complex_grid(size, viewport)
-    roots_xy = np.asarray(params["roots"], dtype=np.float64)
-    roots = roots_xy[:, 0] + 1j * roots_xy[:, 1]
-    max_iter = int(params["max_iter"])
-    relaxation = float(params["relaxation"])
-    conv_iter = np.full(z.shape, max_iter, dtype=np.float64)
-
-    for i in range(max_iter):
-        active = conv_iter == max_iter
-        if not np.any(active):
-            break
-        za = z[active]
-        p = np.ones_like(za)
-        for root in roots:
-            p *= za - root
-        dp = np.zeros_like(za)
-        for skip in range(len(roots)):
-            term = np.ones_like(za)
-            for j, root in enumerate(roots):
-                if j != skip:
-                    term *= za - root
-            dp += term
-        step = np.divide(p, dp, out=np.zeros_like(p), where=np.abs(dp) > 1e-12)
-        za = za - relaxation * step
-        z[active] = za
-        min_dist = np.min(np.abs(za[:, None] - roots[None, :]), axis=1)
-        conv_iter[active] = np.where(min_dist < 1e-5, i + 1, conv_iter[active])
-
-    distances = np.stack([np.abs(z - root) for root in roots], axis=0)
-    root_id = np.argmin(distances, axis=0)
-    min_dist = np.min(distances, axis=0)
-    value = normalize01(root_id / max(1, len(roots) - 1) + 0.35 * (conv_iter / max_iter))
-    density = normalize01(1.0 - conv_iter / max_iter + np.exp(-15.0 * min_dist))
-    angle = np.angle(z)
-    detail = normalize01(edge_detail(root_id.astype(np.float64)) + edge_detail(conv_iter))
-    detail = normalize01(detail + rng.normal(0.0, 0.015, size=detail.shape))
-    return {"value": value, "density": density, "angle": angle, "detail": detail}
-
-
-def render_point_fractal(
+def render_ifs_leaf(
     size: int,
     params: Dict[str, object],
     viewport: Dict[str, float],
     seed: int,
-    leaf_mode: bool,
 ) -> Dict[str, Array]:
     affines = np.asarray(params["affines"], dtype=np.float64)
     probs = np.asarray(params["probs"], dtype=np.float64)
     probs = probs / probs.sum()
     cumulative = np.cumsum(probs)
-    points = int(params["points"])
-    burn_in = int(params["burn_in"])
-    center_x = float(viewport["center_x"])
-    center_y = float(viewport["center_y"])
-    scale = float(viewport["scale"])
-    rotation = float(viewport["rotation"])
+    bounds = np.asarray(params["bounds"], dtype=np.float64)
 
-    if leaf_mode:
-        hist, angle_acc = _ifs_histogram(size, affines, cumulative, points, burn_in, seed, center_x, center_y, scale, rotation)
-    else:
-        weights = np.asarray(params["variation_weights"], dtype=np.float64)
-        hist, angle_acc = _flame_histogram(
-            size, affines, cumulative, weights, points, burn_in, seed, center_x, center_y, scale, rotation
-        )
+    hist, angle_acc = _ifs_histogram(
+        size,
+        affines,
+        cumulative,
+        int(params["points"]),
+        int(params["burn_in"]),
+        seed,
+        float(viewport["center_x"]),
+        float(viewport["center_y"]),
+        float(viewport["scale"]),
+        float(viewport["rotation"]),
+        float(bounds[0]),
+        float(bounds[1]),
+        float(bounds[2]),
+        float(bounds[3]),
+    )
 
     hist = hist.astype(np.float64)
+    angle_acc = angle_acc.astype(np.float64)
     for _ in range(int(params.get("blur_passes", 1))):
         hist = cheap_blur(hist)
         angle_acc = cheap_blur(angle_acc)
@@ -519,21 +577,20 @@ def render_point_fractal(
     value = normalize01(np.log1p(hist))
     density = normalize01(hist)
     angle = np.where(hist > 0, angle_acc / np.maximum(hist, 1.0), 0.0)
-    detail = normalize01(edge_detail(value) + value * 0.45)
-
+    detail = normalize01(edge_detail(value) + value * 0.36)
     return {"value": value, "density": density, "angle": angle, "detail": detail}
 
 
 if njit is not None:
 
-    @njit(cache=True)
+    @njit
     def _lcg_next(state):
         state = (state * np.uint64(6364136223846793005) + np.uint64(1442695040888963407))
         value = ((state >> np.uint64(11)) & np.uint64(9007199254740991)) / 9007199254740992.0
         return state, value
 
 
-    @njit(cache=True)
+    @njit
     def _choose(cumulative, r):
         for i in range(cumulative.shape[0]):
             if r <= cumulative[i]:
@@ -541,17 +598,28 @@ if njit is not None:
         return cumulative.shape[0] - 1
 
 
-    @njit(cache=True)
-    def _ifs_histogram(size, affines, cumulative, points, burn_in, seed, center_x, center_y, scale, rotation):
+    @njit
+    def _ifs_histogram(
+        size,
+        affines,
+        cumulative,
+        points,
+        burn_in,
+        seed,
+        center_x,
+        center_y,
+        scale,
+        rotation,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    ):
         hist = np.zeros((size, size), dtype=np.float64)
         angle_acc = np.zeros((size, size), dtype=np.float64)
         state = np.uint64(seed + 1)
         x = 0.0
         y = 0.0
-        min_x = -3.0
-        max_x = 3.0
-        min_y = 0.0
-        max_y = 10.5
         mid_x = (min_x + max_x) * 0.5
         half_x = (max_x - min_x) * 0.5
         mid_y = (min_y + max_y) * 0.5
@@ -580,68 +648,33 @@ if njit is not None:
                     angle_acc[py, px] += math.atan2(vy, vx + 1e-12)
         return hist, angle_acc
 
-
-    @njit(cache=True)
-    def _flame_histogram(size, affines, cumulative, weights, points, burn_in, seed, center_x, center_y, scale, rotation):
-        hist = np.zeros((size, size), dtype=np.float64)
-        angle_acc = np.zeros((size, size), dtype=np.float64)
-        state = np.uint64(seed + 11)
-        x = 0.0
-        y = 0.0
-        min_v = -2.6
-        max_v = 2.6
-        mid_v = (min_v + max_v) * 0.5
-        half_v = (max_v - min_v) * 0.5
-        cos_t = math.cos(rotation)
-        sin_t = math.sin(rotation)
-        for i in range(points + burn_in):
-            state, r = _lcg_next(state)
-            k = _choose(cumulative, r)
-            a, b, c, d, e, f = affines[k]
-            u = a * x + b * y + e
-            v = c * x + d * y + f
-            r2 = u * u + v * v + 1e-9
-            radius = math.sqrt(r2)
-            theta = math.atan2(v, u)
-
-            nx = weights[0] * u
-            ny = weights[0] * v
-            nx += weights[1] * math.sin(u)
-            ny += weights[1] * math.sin(v)
-            nx += weights[2] * (u * math.sin(r2) - v * math.cos(r2))
-            ny += weights[2] * (u * math.cos(r2) + v * math.sin(r2))
-            nx += weights[3] * (u / r2)
-            ny += weights[3] * (v / r2)
-            nx += weights[4] * ((u - v) * (u + v) / radius)
-            ny += weights[4] * (2.0 * u * v / radius)
-            nx += weights[5] * (theta / math.pi)
-            ny += weights[5] * (radius - 1.0)
-            nx += weights[6] * (radius * math.sin(theta + radius))
-            ny += weights[6] * (radius * math.cos(theta - radius))
-            x = nx
-            y = ny
-            if i >= burn_in:
-                wx = (x - mid_v) / half_v
-                wy = (y - mid_v) / half_v
-                dx = (wx - center_x) / scale
-                dy = (wy - center_y) / scale
-                vx = dx * cos_t + dy * sin_t
-                vy = -dx * sin_t + dy * cos_t
-                px = int((vx + 1.0) * 0.5 * (size - 1))
-                py = int((1.0 - vy) * 0.5 * (size - 1))
-                if 0 <= px < size and 0 <= py < size:
-                    hist[py, px] += 1.0
-                    angle_acc[py, px] += math.atan2(vy, vx + 1e-12)
-        return hist, angle_acc
-
 else:
 
-    def _ifs_histogram(size, affines, cumulative, points, burn_in, seed, center_x, center_y, scale, rotation):
+    def _ifs_histogram(
+        size,
+        affines,
+        cumulative,
+        points,
+        burn_in,
+        seed,
+        center_x,
+        center_y,
+        scale,
+        rotation,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    ):
         rng = np.random.default_rng(seed)
         hist = np.zeros((size, size), dtype=np.float64)
         angle_acc = np.zeros((size, size), dtype=np.float64)
         x = 0.0
         y = 0.0
+        mid_x = (min_x + max_x) * 0.5
+        half_x = (max_x - min_x) * 0.5
+        mid_y = (min_y + max_y) * 0.5
+        half_y = (max_y - min_y) * 0.5
         cos_t = math.cos(rotation)
         sin_t = math.sin(rotation)
         for i in range(points + burn_in):
@@ -649,44 +682,8 @@ else:
             a, b, c, d, e, f = affines[k]
             x, y = a * x + b * y + e, c * x + d * y + f
             if i >= burn_in:
-                wx = x / 3.0
-                wy = (y - 5.25) / 5.25
-                dx = (wx - center_x) / scale
-                dy = (wy - center_y) / scale
-                vx = dx * cos_t + dy * sin_t
-                vy = -dx * sin_t + dy * cos_t
-                px = int((vx + 1.0) * 0.5 * (size - 1))
-                py = int((1.0 - vy) * 0.5 * (size - 1))
-                if 0 <= px < size and 0 <= py < size:
-                    hist[py, px] += 1.0
-                    angle_acc[py, px] += math.atan2(vy, vx + 1e-12)
-        return hist, angle_acc
-
-
-    def _flame_histogram(size, affines, cumulative, weights, points, burn_in, seed, center_x, center_y, scale, rotation):
-        rng = np.random.default_rng(seed)
-        hist = np.zeros((size, size), dtype=np.float64)
-        angle_acc = np.zeros((size, size), dtype=np.float64)
-        x = 0.0
-        y = 0.0
-        cos_t = math.cos(rotation)
-        sin_t = math.sin(rotation)
-        for i in range(points + burn_in):
-            k = int(np.searchsorted(cumulative, rng.random()))
-            a, b, c, d, e, f = affines[k]
-            u, v = a * x + b * y + e, c * x + d * y + f
-            r2 = u * u + v * v + 1e-9
-            radius = math.sqrt(r2)
-            theta = math.atan2(v, u)
-            x = weights[0] * u + weights[1] * math.sin(u) + weights[2] * (u * math.sin(r2) - v * math.cos(r2))
-            y = weights[0] * v + weights[1] * math.sin(v) + weights[2] * (u * math.cos(r2) + v * math.sin(r2))
-            x += weights[3] * (u / r2) + weights[4] * ((u - v) * (u + v) / radius) + weights[5] * (theta / math.pi)
-            y += weights[3] * (v / r2) + weights[4] * (2.0 * u * v / radius) + weights[5] * (radius - 1.0)
-            x += weights[6] * (radius * math.sin(theta + radius))
-            y += weights[6] * (radius * math.cos(theta - radius))
-            if i >= burn_in:
-                wx = x / 2.6
-                wy = y / 2.6
+                wx = (x - mid_x) / half_x
+                wy = (y - mid_y) / half_y
                 dx = (wx - center_x) / scale
                 dy = (wy - center_y) / scale
                 vx = dx * cos_t + dy * sin_t
@@ -727,52 +724,55 @@ def cheap_blur(values: Array) -> Array:
     ) / 5.0
 
 
-def unified_color(features: Dict[str, Array], palette: Dict[str, float], rng: np.random.Generator) -> Array:
+def colorize_leaf(features: Dict[str, Array], palette: Dict[str, object], rng: np.random.Generator) -> Array:
     value = normalize01(features["value"])
     density = normalize01(features["density"])
     detail = normalize01(features["detail"])
-    angle = (features["angle"] + math.pi) / (2.0 * math.pi)
-    angle = np.mod(angle, 1.0)
+    angle = np.mod((features["angle"] + math.pi) / (2.0 * math.pi), 1.0)
 
     contrast = float(palette["contrast"])
     gamma = float(palette["gamma"])
-    value = np.clip((value - 0.5) * contrast + 0.5, 0.0, 1.0)
-    value = np.power(value, gamma)
+    tone = np.clip((value - 0.5) * contrast + 0.5, 0.0, 1.0)
+    tone = np.power(tone, gamma)
+    tone = np.clip(tone * (0.78 + 0.30 * density), 0.0, 1.0)
 
-    hue = np.mod(
-        float(palette["hue"])
-        + float(palette["hue_scale"]) * value
-        + float(palette["angle_mix"]) * angle
-        + 0.10 * detail,
-        1.0,
-    )
-    sat = np.clip(float(palette["sat"]) * (0.55 + 0.55 * detail + 0.15 * density), 0.0, 1.0)
-    val = np.clip(float(palette["val"]) * (0.18 + 0.82 * value) * (0.72 + 0.38 * density), 0.0, 1.0)
+    background = color_array(palette["background"])
+    shadow = color_array(palette["shadow"])
+    mid = color_array(palette["mid"])
+    highlight = color_array(palette["highlight"])
+    accent = color_array(palette["accent"])
 
-    rgb = hsv_to_rgb(hue, sat, val)
-    bg = float(palette["background"])
-    rgb = np.clip(rgb + bg * rng.random(3), 0.0, 1.0)
-    rgb = subtle_vignette(rgb)
+    low_mix = smoothstep(tone * 2.0)
+    high_mix = smoothstep(tone * 2.0 - 1.0)
+    body = lerp(shadow, mid, low_mix)
+    body = lerp(body, highlight, high_mix)
+
+    vein = np.clip(detail * density * float(palette["vein_strength"]), 0.0, 1.0)
+    angle_wash = 0.10 * np.sin(2.0 * math.pi * (angle + 0.15)) * density
+    body = np.clip(body + accent * vein[..., None] + angle_wash[..., None], 0.0, 1.0)
+
+    alpha = smoothstep(np.clip(density * 1.35 + value * 0.25, 0.0, 1.0))
+    rgb = lerp(background, body, alpha)
+
+    grain = float(palette["grain"])
+    if grain > 0.0:
+        rgb = rgb + rng.normal(0.0, grain, size=rgb.shape)
+
+    rgb = subtle_vignette(np.clip(rgb, 0.0, 1.0))
     return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def hsv_to_rgb(h: Array, s: Array, v: Array) -> Array:
-    i = np.floor(h * 6.0).astype(np.int32)
-    f = h * 6.0 - i
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-    i = i % 6
-    shape = h.shape + (3,)
-    rgb = np.empty(shape, dtype=np.float64)
-    masks = [i == k for k in range(6)]
-    rgb[masks[0]] = np.stack([v, t, p], axis=-1)[masks[0]]
-    rgb[masks[1]] = np.stack([q, v, p], axis=-1)[masks[1]]
-    rgb[masks[2]] = np.stack([p, v, t], axis=-1)[masks[2]]
-    rgb[masks[3]] = np.stack([p, q, v], axis=-1)[masks[3]]
-    rgb[masks[4]] = np.stack([t, p, v], axis=-1)[masks[4]]
-    rgb[masks[5]] = np.stack([v, p, q], axis=-1)[masks[5]]
-    return rgb
+def color_array(color: object) -> Array:
+    return np.asarray(color, dtype=np.float64).reshape((1, 1, 3))
+
+
+def lerp(a: Array, b: Array, t: Array) -> Array:
+    return a * (1.0 - t[..., None]) + b * t[..., None]
+
+
+def smoothstep(x: Array) -> Array:
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
 
 
 def subtle_vignette(rgb: Array) -> Array:
@@ -780,7 +780,7 @@ def subtle_vignette(rgb: Array) -> Array:
     axis = np.linspace(-1.0, 1.0, size, dtype=np.float64)
     x, y = np.meshgrid(axis, axis)
     r = np.sqrt(x * x + y * y)
-    vignette = np.clip(1.08 - 0.23 * r * r, 0.75, 1.08)
+    vignette = np.clip(1.07 - 0.22 * r * r, 0.76, 1.07)
     return rgb * vignette[..., None]
 
 
@@ -803,14 +803,14 @@ def iter_results(tasks: List[RenderTask], workers: int) -> Iterable[Tuple[int, A
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    warn_if_slow_path(args)
+    warn_if_slow_path()
 
     image_dir, metadata_path, start_index, start_function_id = prepare_output(args)
     tasks = make_tasks(args, start_index=start_index, start_function_id=start_function_id)
 
     metadata_file = metadata_path.open("a", encoding="utf-8") if args.metadata else None
     try:
-        progress = tqdm(iter_results(tasks, args.workers), total=len(tasks), desc="Generating fractals")
+        progress = tqdm(iter_results(tasks, args.workers), total=len(tasks), desc="Generating leaf fractals")
         for result in progress:
             metadata = save_result(result, image_dir)
             if metadata_file is not None:
@@ -819,7 +819,7 @@ def main() -> None:
         if metadata_file is not None:
             metadata_file.close()
 
-    print(f"Generated {len(tasks)} images in: {image_dir}")
+    print(f"Generated {len(tasks)} leaf images in: {image_dir}")
     if args.metadata:
         print(f"Metadata appended to: {metadata_path}")
 
