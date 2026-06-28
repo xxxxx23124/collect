@@ -942,7 +942,7 @@ class CrossFusionBlock(nn.Module):
 
         cross_map = cross_tokens.transpose(1, 2).reshape(B, C, height, width)
         cross_map = self.cross_grn(cross_map, time_emb)
-        gate = torch.sigmoid(self.gate(cnn_map, time_emb) + self.gate_init_bias)
+        gate = torch.sigmoid(self.gate(query_tokens, time_emb) + self.gate_init_bias)
 
         state_map = state_tokens.transpose(1, 2).reshape(B, C, height, width)
         state_map = state_map + gate.view(B, C, 1, 1) * self.layer_scale.view(1, C, 1, 1) * cross_map
