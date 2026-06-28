@@ -85,3 +85,6 @@ mlruns/
 *.log
 *.out
 .DS_Store
+
+# Generated DDPM fractal dataset
+experiment/DDPM/generated_fractals/
