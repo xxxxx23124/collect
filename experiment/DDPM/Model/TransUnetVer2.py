@@ -417,35 +417,25 @@ class TimeAwareCondConv2d(nn.Module):
         return off_diag.square().mean()
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
         routing_logits = self.router(x, time_emb)
         routing_weights = F.softmax(routing_logits, dim=1)
-        weight_eff = (routing_weights.view(B, self.num_experts, 1, 1, 1, 1) *
-                      self.weight.unsqueeze(0)).sum(1)
 
-        if self.bias is not None:
-            bias_eff = (routing_weights.view(B, self.num_experts, 1) * self.bias.unsqueeze(0)).sum(1)
-            bias_eff = bias_eff.view(-1)
-        else:
-            bias_eff = None
-        x_flat = x.view(1, B * C, H, W)
-        weight_flat = weight_eff.view(B * self.out_channels,
-                                      self.in_channels // self.groups,
-                                      self.kernel_size,
-                                      self.kernel_size)
+        out = None
+        for expert_idx in range(self.num_experts):
+            expert_bias = self.bias[expert_idx] if self.bias is not None else None
+            expert_out = F.conv2d(
+                x,
+                self.weight[expert_idx],
+                expert_bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=1,
+                groups=self.groups
+            )
+            expert_out = expert_out * routing_weights[:, expert_idx].view(-1, 1, 1, 1)
+            out = expert_out if out is None else out + expert_out
 
-        total_groups = B * self.groups
-
-        out_flat = F.conv2d(
-            x_flat,
-            weight_flat,
-            bias_eff,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=1,
-            groups=total_groups
-        )
-        return out_flat.view(B, self.out_channels, out_flat.shape[2], out_flat.shape[3])
+        return out
 
 
 class AdaCLN(nn.Module):
