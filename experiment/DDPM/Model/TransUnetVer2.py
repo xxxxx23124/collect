@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
@@ -9,6 +10,29 @@ from torch.utils.checkpoint import checkpoint
 # ================================================
 # 2026/4/20 by Xingqian She
 # ================================================
+
+
+@dataclass
+class TransUNet64Config:
+    time_emb_dim: int = 256
+    time_hidden_dim: int = 512
+    time_layers: int = 5
+    num_experts: int = 4
+    attn_head_dim: int = 64
+    groups: int = 4
+    dense_inc: int = 16
+    stem_channels: int = 64
+    encoder_channels: tuple[int, int, int] = (64, 128, 256)
+    encoder_blocks: tuple[int, int, int] = (3, 3, 4)
+    down_channels: tuple[int, int, int] = (128, 256, 512)
+    bottleneck_inner_channels: int = 1024
+    bottleneck_layers: int = 10
+    bottleneck_heads: int = 16
+    encoder_attn_heads: int = 5
+    decoder_up_channels: tuple[int, int, int] = (256, 192, 96)
+    decoder_channels: tuple[int, int, int] = (384, 192, 96)
+    decoder_blocks: tuple[int, int, int] = (4, 3, 3)
+    decoder_attn_heads: int = 7
 
 
 class Factory:
@@ -34,8 +58,16 @@ class Factory:
             num_experts=self.convolution_kernel_group
         )
 
-    def get_timemlp(self):
-        pass
+    def get_time_mlp(self, hidden_dim=512, num_layers=5, fourier_scale=16.0):
+        return TimeMLP(
+            time_emb_dim=self.time_emb_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            fourier_scale=fourier_scale
+        )
+
+    def get_timemlp(self, hidden_dim=512, num_layers=5, fourier_scale=16.0):
+        return self.get_time_mlp(hidden_dim, num_layers, fourier_scale)
 
     def get_act(self):
         return nn.SiLU()
@@ -158,71 +190,18 @@ class GaussianFourierProjection(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
-class LoRAHyperLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, rank):
-        super(LoRAHyperLayer, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.rank = rank
-
-        self.a_generator = nn.Sequential(
-            nn.Linear(input_dim, max(8, input_dim // 8)),
-            nn.SiLU(),
-            nn.Linear(max(8, input_dim // 8), input_dim * rank, bias=False)
-        )
-
-        self.b_generator = nn.Sequential(
-            nn.Linear(input_dim, max(8, input_dim // 8)),
-            nn.SiLU(),
-            nn.Linear(max(8, input_dim // 8), rank * output_dim, bias=False)
-        )
-
-    def forward(self, x)  -> dict[str, torch.Tensor]:
-
-        a_flat = self.a_generator(x)
-        b_flat = self.b_generator(x)
-
-        A = a_flat.reshape(-1, self.input_dim, self.rank)
-        B = b_flat.reshape(-1, self.rank, self.output_dim)
-
-        return {'A': A, 'B': B}
-
-class HyperContent(nn.Module):
-    def __init__(self, input_dim, output_dim, rank = None):
-        super().__init__()
-        self.rank = rank if rank is not None else max(8, input_dim // 8)
-        self.hyper_layer = LoRAHyperLayer(input_dim, output_dim, self.rank)
-
-    def forward(self, x)  -> torch.Tensor:
-        params = self.hyper_layer(x)
-        A = params['A']
-        B = params['B']
-
-        res = torch.einsum('...i, bir, bro -> ...o', x, A, B)
-        return res
-
-class HybridSwiGLU(nn.Module):
-    def __init__(self, input_dim, output_dim, up_proj_dim):
-        super().__init__()
-        self.static_gate = nn.Linear(input_dim, up_proj_dim)
-        self.dynamic_content = HyperContent(input_dim, up_proj_dim, max(8, up_proj_dim // 8))
-        self.act = nn.SiLU()
-        self.static_down = nn.Linear(up_proj_dim, output_dim, bias=False)
-
-    def forward(self, x) -> torch.Tensor:
-        static_gate = self.static_gate(x)
-        dynamic_content = self.dynamic_content(x)
-        res = self.static_down(self.act(static_gate) * dynamic_content)
-        return res
-
 class ResMLPBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.hybrid_net = HybridSwiGLU(dim,dim,4*dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.hybrid_net(x))
+        return self.act(x + self.net(x))
 
 
 class TimeMLP(nn.Module):
@@ -233,6 +212,10 @@ class TimeMLP(nn.Module):
                  fourier_scale=16.0):
         super().__init__()
         self.fourier = GaussianFourierProjection(hidden_dim, scale=fourier_scale)
+        self.input_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU()
+        )
         self.mapping = nn.ModuleList([
             ResMLPBlock(hidden_dim) for _ in range(num_layers)
         ])
@@ -242,6 +225,7 @@ class TimeMLP(nn.Module):
         if time.dtype == torch.long:
             time = time.float()
         x = self.fourier(time)
+        x = self.input_proj(x)
         for block in self.mapping:
             x = block(x)
         return self.out_proj(x)
@@ -252,8 +236,12 @@ class Modulator(nn.Module):
                  in_channels,
                  out_channels):
         super().__init__()
-        self.hybrid_net = HybridSwiGLU(in_channels, in_channels, 4 * in_channels)
-
+        hidden_dim = max(64, in_channels // 4)
+        self.net = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, in_channels),
+        )
         self.act = nn.SiLU()
         self.to_out = nn.Linear(in_channels, out_channels, bias=False)
 
@@ -263,8 +251,25 @@ class Modulator(nn.Module):
         nn.init.zeros_(self.to_out.weight)
 
     def forward(self, time_emb: torch.Tensor) -> torch.Tensor:
-        time_emb = self.act(time_emb + self.hybrid_net(time_emb))
+        time_emb = self.act(time_emb + self.net(time_emb))
         return self.to_out(time_emb)
+
+
+class TinyContentEncoder(nn.Module):
+    def __init__(self, in_channels, out_channels=None):
+        super().__init__()
+        out_channels = out_channels if out_channels is not None else min(64, max(16, in_channels // 4))
+        self.out_channels = out_channels
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=False),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).flatten(1)
 
 
 class ContentAwareModulator(nn.Module):
@@ -277,10 +282,16 @@ class ContentAwareModulator(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim if hidden_dim is not None else max(64, in_channels // 4)
         self.eps = eps
+        self.content_encoder = TinyContentEncoder(in_channels)
+        content_dim = in_channels * 2 + self.content_encoder.out_channels
         self.to_q = nn.Linear(time_emb_dim, self.hidden_dim, bias=False)
-        self.to_k = nn.Linear(in_channels * 2, self.hidden_dim, bias=False)
-        self.to_v = nn.Linear(in_channels * 2, self.hidden_dim, bias=False)
-        self.hybrid_net = HybridSwiGLU(hidden_dim, hidden_dim, 4 * hidden_dim)
+        self.to_k = nn.Linear(content_dim, self.hidden_dim, bias=False)
+        self.to_v = nn.Linear(content_dim, self.hidden_dim, bias=False)
+        self.mixer = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
+        )
         self.to_out = nn.Linear(self.hidden_dim, out_channels, bias=False)
 
         self._init_weights()
@@ -291,7 +302,9 @@ class ContentAwareModulator(nn.Module):
     def _compute_stats(self, x: torch.Tensor) -> torch.Tensor:
         mu = x.mean(dim=(2, 3))
         std = x.std(dim=(2, 3), unbiased=False) + self.eps
-        return torch.cat([mu, std], dim=1)
+        tiny_feat = self.content_encoder(x)
+        # 均值/方差提供稳定全局统计，小卷积补充局部纹理信息。
+        return torch.cat([mu, std, tiny_feat], dim=1)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         stats = self._compute_stats(x)
@@ -301,7 +314,7 @@ class ContentAwareModulator(nn.Module):
 
         attn = torch.sigmoid(q * k)
         x_hidden = v * attn
-        x_mixed = x_hidden + self.hybrid_net(x_hidden)
+        x_mixed = x_hidden + self.mixer(x_hidden)
         return self.to_out(x_mixed)
 
 
@@ -361,6 +374,8 @@ class TimeAwareCondConv2d(nn.Module):
             self.register_parameter('bias', None)
 
         self.router = CondConvRouter(in_channels, time_emb_dim, num_experts)
+        ortho_mask = torch.ones(num_experts, num_experts) - torch.eye(num_experts)
+        self.register_buffer("ortho_offdiag_mask", ortho_mask)
 
         self._init_weights()
 
@@ -377,19 +392,15 @@ class TimeAwareCondConv2d(nn.Module):
 
     def get_ortho_loss(self):
         w = self.weight
-        n_exp, out_c, in_per_grp, k, k = w.shape
+        n_exp, out_c = w.shape[:2]
 
+        # 逐输出通道约束专家方向不同，只惩罚专家间的非对角相似度。
         w_per_channel = w.permute(1, 0, 2, 3, 4).reshape(out_c, n_exp, -1)
-
-        w_norm = F.normalize(w_per_channel, p=2, dim=2)
-
+        w_norm = F.normalize(w_per_channel, p=2, dim=2, eps=1e-6)
         gram = torch.bmm(w_norm, w_norm.transpose(1, 2).contiguous())
+        off_diag = gram * self.ortho_offdiag_mask.to(dtype=gram.dtype, device=gram.device)
 
-        identity = torch.eye(n_exp, device=w.device).unsqueeze(0).expand(out_c, n_exp, n_exp)
-
-        diff = torch.norm(gram - identity, p='fro', dim=(1, 2))
-
-        return diff.mean()
+        return off_diag.square().mean()
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -929,83 +940,68 @@ class DiffusionTransUNet_64(nn.Module):
     def __init__(self,
                  in_channels=3,
                  out_channels=3,
-                 time_emb_dim=256):
+                 time_emb_dim=256,
+                 config: TransUNet64Config | None = None):
         super().__init__()
-        self.time_emb_dim = time_emb_dim
-        self.time_mlp = TimeMLP(time_emb_dim=time_emb_dim, hidden_dim=512)
+        self.config = config or TransUNet64Config(time_emb_dim=time_emb_dim)
+        self.time_emb_dim = self.config.time_emb_dim
 
-        # 定义工厂类，注意：旋转编码的实现在factory中
-        factory = Factory(time_emb_dim=time_emb_dim, convolution_kernel_group=4, attn_head_dim=64)
+        factory = Factory(
+            time_emb_dim=self.config.time_emb_dim,
+            convolution_kernel_group=self.config.num_experts,
+            attn_head_dim=self.config.attn_head_dim
+        )
+        self.time_mlp = factory.get_time_mlp(
+            hidden_dim=self.config.time_hidden_dim,
+            num_layers=self.config.time_layers
+        )
 
-        # Stem
-        self.stem = self.stem = Stem(in_channels=in_channels, out_channels=64, factory=factory)
+        c = self.config
+        enc1, enc2, enc3 = c.encoder_channels
+        down1, down2, down3 = c.down_channels
+        up1, up2, up3 = c.decoder_up_channels
+        dec1, dec2, dec3 = c.decoder_channels
 
-        # ================= ENCODER =================
-        # Enc1: 64ch
-        self.enc1 = DualPathStage(in_channels=64, res_channels=64, num_blocks=3, dense_inc=16, groups=4,
-                                  factory=factory)
-        # Down1: 112 -> 128
-        self.down1 = DownsampleLayer(in_channels=112, out_channels=128, dense_inc=0, factory=factory)
+        enc1_skip = enc1 + c.encoder_blocks[0] * c.dense_inc
+        enc2_skip = enc2 + c.encoder_blocks[1] * c.dense_inc
+        enc3_skip = enc3 + c.encoder_blocks[2] * c.dense_inc
+        dec1_out = dec1 + c.decoder_blocks[0] * c.dense_inc
+        dec2_out = dec2 + c.decoder_blocks[1] * c.dense_inc
+        dec3_out = dec3 + c.decoder_blocks[2] * c.dense_inc
 
-        # Enc2: 128ch
-        self.enc2 = DualPathStage(in_channels=128, res_channels=128, num_blocks=3, dense_inc=16, groups=4,
-                                  factory=factory)
-        # Down2: 176 -> 256
-        self.down2 = DownsampleLayer(in_channels=176, out_channels=256, dense_inc=0, factory=factory)
+        self.stem = Stem(in_channels=in_channels, out_channels=c.stem_channels, factory=factory)
 
-        # Enc3: 256ch
-        self.enc3 = DualPathStage(in_channels=256, res_channels=256, num_blocks=4, dense_inc=16, groups=4,
-                                  factory=factory)
-        self.att3 = SpatialSelfAttention(channels=320, num_heads=5, factory=factory)
-        # Down3: 320 -> 512
-        self.down3 = DownsampleLayer(in_channels=320, out_channels=512, dense_inc=0, factory=factory)
+        self.enc1 = DualPathStage(c.stem_channels, enc1, c.encoder_blocks[0], c.dense_inc, c.groups, factory)
+        self.down1 = DownsampleLayer(enc1_skip, down1, dense_inc=0, factory=factory)
+        self.enc2 = DualPathStage(down1, enc2, c.encoder_blocks[1], c.dense_inc, c.groups, factory)
+        self.down2 = DownsampleLayer(enc2_skip, down2, dense_inc=0, factory=factory)
+        self.enc3 = DualPathStage(down2, enc3, c.encoder_blocks[2], c.dense_inc, c.groups, factory)
+        self.att3 = SpatialSelfAttention(enc3_skip, c.encoder_attn_heads, factory)
+        self.down3 = DownsampleLayer(enc3_skip, down3, dense_inc=0, factory=factory)
 
-        # ================= BOTTLENECK =================
-        self.bot_stage = BottleneckTransformerStage(in_channels=512, out_channels=512, inner_channels=1024,
-                                                    num_layers=10,
-                                                    num_heads=16, factory=factory)
+        self.bot_stage = BottleneckTransformerStage(
+            in_channels=down3,
+            out_channels=down3,
+            inner_channels=c.bottleneck_inner_channels,
+            num_layers=c.bottleneck_layers,
+            num_heads=c.bottleneck_heads,
+            factory=factory
+        )
 
-        # ================= DECODER =================
+        self.up1 = PixelShuffleUpsampleLayer(down3, up1, dense_inc=0, factory=factory)
+        self.fuse1 = FeatureFusionBlock(up1 + enc3_skip, dec1, factory=factory)
+        self.dec1 = DualPathStage(dec1, dec1, c.decoder_blocks[0], c.dense_inc, c.groups, factory)
+        self.dec1_att = SpatialSelfAttention(dec1_out, c.decoder_attn_heads, factory)
 
-        # --- Up 1 (8x8 -> 16x16) ---
-        # Bot Out (512) -> Up (256)
-        self.up1 = PixelShuffleUpsampleLayer(in_channels=512, out_channels=256, dense_inc=0, factory=factory)
+        self.up2 = PixelShuffleUpsampleLayer(dec1_out, up2, dense_inc=0, factory=factory)
+        self.fuse2 = FeatureFusionBlock(up2 + enc2_skip, dec2, factory=factory)
+        self.dec2 = DualPathStage(dec2, dec2, c.decoder_blocks[1], c.dense_inc, c.groups, factory)
 
-        # Concat: Up1(256) + Enc3_Skip(320) = 576
-        # Fusion: 560 -> 384
-        self.fuse1 = FeatureFusionBlock(in_channels=576, out_channels=384, factory=factory)
+        self.up3 = PixelShuffleUpsampleLayer(dec2_out, up3, dense_inc=0, factory=factory)
+        self.fuse3 = FeatureFusionBlock(up3 + enc1_skip, dec3, factory=factory)
+        self.dec3 = DualPathStage(dec3, dec3, c.decoder_blocks[2], c.dense_inc, c.groups, factory)
 
-        # Stage: 处理 384 通道
-        self.dec1 = DualPathStage(in_channels=384, res_channels=384, num_blocks=4, dense_inc=16, groups=4,
-                                  factory=factory)
-        self.dec1_att = SpatialSelfAttention(channels=448, num_heads=7, factory=factory)
-
-        # --- Up 2 (16x16 -> 32x32) ---
-        # Dec1 Out (448) -> Up (192)
-        self.up2 = PixelShuffleUpsampleLayer(in_channels=448, out_channels=192, dense_inc=0, factory=factory)
-
-        # Concat: Up2(192) + Enc2_Skip(176) = 368
-        # Fusion: 368 -> 192
-        self.fuse2 = FeatureFusionBlock(in_channels=368, out_channels=192, factory=factory)
-
-        self.dec2 = DualPathStage(in_channels=192, res_channels=192, num_blocks=3, dense_inc=16, groups=4,
-                                  factory=factory)
-        # Dec2 Out: 240
-
-        # --- Up 3 (32x32 -> 64x64) ---
-        # Dec2 Out (240) -> Up (96)
-        self.up3 = PixelShuffleUpsampleLayer(in_channels=240, out_channels=96, dense_inc=0, factory=factory)
-
-        # Concat: Up3(96) + Enc1_Skip(112) = 208
-        # Fusion: 208 -> 96
-        self.fuse3 = FeatureFusionBlock(in_channels=208, out_channels=96, factory=factory)
-
-        self.dec3 = DualPathStage(in_channels=96, res_channels=96, num_blocks=3, dense_inc=16, groups=4,
-                                  factory=factory)
-        # Dec3 Out: 144
-
-        # ================= OUTPUT =================
-        self.final = TimeAwareToRGB(in_channels=144, out_channels=out_channels, factory=factory)
+        self.final = TimeAwareToRGB(in_channels=dec3_out, out_channels=out_channels, factory=factory)
 
         # 在初始化时缓存所有 CondConv 层，避免每次计算 loss 时遍历整个网络
         self.cond_conv_layers = [

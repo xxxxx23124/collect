@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -16,7 +18,11 @@ def run_training(
         accumulation_steps=4,  # 累积几步更新一次
         lr=2e-4,
         device="cuda",
-        save_path="ddpm_cat.pth",
+        save_path=None,
+        save_model=False,
+        sample_dir=".",
+        sample_every=1,
+        num_samples=16,
         use_monitor=False,
 ):
     # 1. 初始化模型和 DDPM
@@ -28,6 +34,8 @@ def run_training(
 
     # 3. 优化器和调度器
     optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=0)
+    sample_dir = Path(sample_dir)
+    sample_dir.mkdir(parents=True, exist_ok=True)
 
     # 余弦退火调度器，T_max 设为总步数或 Epoch 数
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -113,16 +121,16 @@ def run_training(
         avg_loss = epoch_loss / len(dataloader)
         print(f"📉 Epoch {epoch + 1} Average Loss: {avg_loss:.4f}")
 
-        # 每隔 10 个 epoch 保存一次，并尝试采样看效果
-        # if (epoch + 1) % 10 == 0:
-            # torch.save(ddpm.model.state_dict(), save_path)
-            # print(f"💾 Model saved to {save_path}")
+        if save_model and save_path is not None:
+            torch.save(ddpm.model.state_dict(), save_path)
+            print(f"💾 Model saved to {save_path}")
 
-        # 采样并保存图片
-        print("🎨 Sampling images...")
-        generated_imgs = ddpm.sample(num_samples=16, img_size=64)
-        save_image(generated_imgs, f"output_epoch_{epoch + 1}.png", nrow=4)
-        print(f"✅ Saved sample to output_epoch_{epoch + 1}.png")
+        if sample_every > 0 and (epoch + 1) % sample_every == 0:
+            print("🎨 Sampling images...")
+            generated_imgs = ddpm.sample(num_samples=num_samples, img_size=64)
+            sample_path = sample_dir / f"output_epoch_{epoch + 1}.png"
+            save_image(generated_imgs, sample_path, nrow=4)
+            print(f"✅ Saved sample to {sample_path}")
 
     if use_monitor:
         monitor.close()

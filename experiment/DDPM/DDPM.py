@@ -65,6 +65,10 @@ class DDPM(nn.Module):
     def device(self):
         return self.beta.device
 
+    def normalize_time(self, t: torch.Tensor) -> torch.Tensor:
+        # TimeMLP 使用连续时间输入，这里统一映射到 [0, 1]。
+        return t.float() / self.timesteps
+
     def extract(self, a, t, x_shape):
         """
         辅助函数：从长为 T 的一维张量 a 中提取对应时间步 t 的值，
@@ -105,9 +109,7 @@ class DDPM(nn.Module):
         x_t, noise = self.add_noise(x_0, t)
 
         # 3. 神经网络预测噪声
-        t_normalized = t.float() / self.timesteps
-        # 用了 GaussianFourierProjection，所以 必须归一化
-        predicted_noise = self.model(x_t, t_normalized)
+        predicted_noise = self.model(x_t, self.normalize_time(t))
 
         # 4. 计算 MSE Loss
         loss = F.mse_loss(predicted_noise, noise)
@@ -119,19 +121,18 @@ class DDPM(nn.Module):
         """
         采样过程 (Reverse Process): 从纯噪声生成图像
         """
+        was_training = self.model.training
         self.model.eval()
 
         # 1. 从标准正态分布采样 x_T
-        x = torch.randn(num_samples, channels, img_size, img_size).to(self.device)
+        x = torch.randn(num_samples, channels, img_size, img_size, device=self.device)
 
         # 2. 从 T-1 倒推到 0
         for i in tqdm(reversed(range(self.timesteps)), desc="Sampling", total=self.timesteps):
             t = (torch.ones(num_samples) * i).long().to(self.device)
 
             # 预测噪声
-            t_normalized = t.float() / self.timesteps
-            # 用了 GaussianFourierProjection，所以 必须归一化
-            predicted_noise = self.model(x, t_normalized)
+            predicted_noise = self.model(x, self.normalize_time(t))
 
             # 计算均值 mu
             # 公式: x_{t-1} = 1/sqrt(alpha) * (x_t - (beta / sqrt(1-alpha_hat)) * eps)
@@ -156,7 +157,7 @@ class DDPM(nn.Module):
                 # 但为了逻辑清晰，保持这个判断
                 x = mu
 
-        self.model.train()
+        self.model.train(was_training)
 
         # 将图像还原回 [0, 1] 范围并 clamp
         x = (x.clamp(-1, 1) + 1) / 2
