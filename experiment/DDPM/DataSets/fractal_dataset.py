@@ -1,10 +1,32 @@
 import os
+import random
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union
 
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+
+
+class RandomDihedralTransform:
+    """Randomly apply one of the 8 rotations/reflections of a square image."""
+
+    _operations = (
+        None,
+        Image.Transpose.ROTATE_90,
+        Image.Transpose.ROTATE_180,
+        Image.Transpose.ROTATE_270,
+        Image.Transpose.FLIP_LEFT_RIGHT,
+        Image.Transpose.FLIP_TOP_BOTTOM,
+        Image.Transpose.TRANSPOSE,
+        Image.Transpose.TRANSVERSE,
+    )
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        operation = random.choice(self._operations)
+        if operation is None:
+            return image
+        return image.transpose(operation)
 
 
 class FractalDataset(Dataset):
@@ -16,6 +38,7 @@ class FractalDataset(Dataset):
         image_size: int = 512,
         extensions: Optional[Sequence[str]] = None,
         random_horizontal_flip: bool = True,
+        random_geometric_augment: bool = True,
     ):
         super().__init__()
         if root is None:
@@ -25,7 +48,9 @@ class FractalDataset(Dataset):
         self.image_paths = self._scan_images(self.root)
 
         transform_steps = [transforms.Resize((image_size, image_size))]
-        if random_horizontal_flip:
+        if random_geometric_augment:
+            transform_steps.append(RandomDihedralTransform())
+        elif random_horizontal_flip:
             transform_steps.append(transforms.RandomHorizontalFlip(p=0.5))
         transform_steps.extend(
             [

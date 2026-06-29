@@ -9,37 +9,57 @@ from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
-class TransUNet64Config:
+class TransUNetConfig:
+    image_size: int | tuple[int, int] = 512
     time_emb_dim: int = 128
     time_hidden_dim: int = 256
     time_layers: int = 3
     num_experts: int = 2
     attn_head_dim: int = 32
+    rope_base: float = 500.0
+    rope_max_size: int | tuple[int, int] | None = None
     groups: int = 4
     dense_inc: int = 8
     stem_channels: int = 32
-    encoder_channels: tuple[int, int, int] = (32, 64, 128)
-    encoder_blocks: tuple[int, int, int] = (1, 1, 2)
-    down_channels: tuple[int, int, int] = (64, 128, 256)
+    encoder_channels: tuple[int, ...] = (32, 64, 128)
+    encoder_blocks: tuple[int, ...] = (1, 1, 2)
+    decoder_blocks: tuple[int, ...] = (2, 1, 1)
+    decoder_channels: tuple[int, ...] | None = None
+    bottleneck_channels: int = 256
     bottleneck_inner_channels: int = 256
     bottleneck_layers: int = 2
     bottleneck_heads: int = 8
+    encoder_attn_levels: tuple[int, ...] = (2,)
+    decoder_attn_levels: tuple[int, ...] = (0,)
     encoder_attn_heads: int = 5
-    decoder_up_channels: tuple[int, int, int] = (128, 96, 48)
-    decoder_channels: tuple[int, int, int] = (192, 96, 48)
-    decoder_blocks: tuple[int, int, int] = (2, 1, 1)
     decoder_attn_heads: int = 7
+
+
+def _to_2tuple(value: int | tuple[int, int], name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return value, value
+    if isinstance(value, tuple) and len(value) == 2:
+        return int(value[0]), int(value[1])
+    raise ValueError(f"{name} must be an int or a tuple of two ints, got {value!r}.")
 
 
 class Factory:
     def __init__(self,
                  time_emb_dim,
                  convolution_kernel_group=4,
-                 attn_head_dim=64,):
+                 attn_head_dim=64,
+                 rope_height=256,
+                 rope_width=256,
+                 rope_base=500.0,):
         self.time_emb_dim = time_emb_dim
         self.convolution_kernel_group = convolution_kernel_group
         self.attn_head_dim = attn_head_dim
-        self.rope = RoPE2D(dim=self.attn_head_dim)
+        self.rope = RoPE2D(
+            dim=self.attn_head_dim,
+            height=rope_height,
+            width=rope_width,
+            base=rope_base
+        )
 
     def get_condconv(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False):
         return TimeAwareCondConv2d(
@@ -864,6 +884,43 @@ class SpatialSelfAttention(nn.Module):
         return residual + out
 
 
+class TimeAwareIdentity(nn.Module):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class AttentiveDualPathStage(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 res_channels: int,
+                 num_blocks: int,
+                 dense_inc: int,
+                 groups: int,
+                 factory: Factory,
+                 attn_heads: int | None = None,
+                 expansion_ratio: int = 4):
+        super().__init__()
+        self.stage = DualPathStage(
+            in_channels=in_channels,
+            res_channels=res_channels,
+            num_blocks=num_blocks,
+            dense_inc=dense_inc,
+            groups=groups,
+            factory=factory,
+            expansion_ratio=expansion_ratio
+        )
+        self.out_channels = self.stage.out_channels
+        self.attn = (
+            SpatialSelfAttention(self.out_channels, attn_heads, factory)
+            if attn_heads is not None
+            else TimeAwareIdentity()
+        )
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        x = self.stage(x, time_emb)
+        return self.attn(x, time_emb)
+
+
 class TransformerBlock(nn.Module):
     def __init__(self,
                  channels: int,
@@ -1069,115 +1126,169 @@ class TimeAwareToRGB(nn.Module):
         return self.conv(x, time_emb)
 
 
-class DiffusionTransUNet_64(nn.Module):
+class DiffusionTransUNet(nn.Module):
     def __init__(self,
                  in_channels=3,
                  out_channels=3,
                  time_emb_dim=128,
-                 config: TransUNet64Config | None = None):
+                 config: TransUNetConfig | None = None):
         super().__init__()
-        self.config = config or TransUNet64Config(time_emb_dim=time_emb_dim)
+        self.config = config or TransUNetConfig(time_emb_dim=time_emb_dim)
+        self._validate_config()
         self.time_emb_dim = self.config.time_emb_dim
 
+        c = self.config
+        rope_size = c.rope_max_size if c.rope_max_size is not None else c.image_size
+        rope_height, rope_width = _to_2tuple(rope_size, "rope_max_size" if c.rope_max_size is not None else "image_size")
+
         factory = Factory(
-            time_emb_dim=self.config.time_emb_dim,
-            convolution_kernel_group=self.config.num_experts,
-            attn_head_dim=self.config.attn_head_dim
+            time_emb_dim=c.time_emb_dim,
+            convolution_kernel_group=c.num_experts,
+            attn_head_dim=c.attn_head_dim,
+            rope_height=rope_height,
+            rope_width=rope_width,
+            rope_base=c.rope_base
         )
         self.time_mlp = factory.get_time_mlp(
-            hidden_dim=self.config.time_hidden_dim,
-            num_layers=self.config.time_layers
+            hidden_dim=c.time_hidden_dim,
+            num_layers=c.time_layers
         )
-
-        c = self.config
-        enc1, enc2, enc3 = c.encoder_channels
-        down1, down2, down3 = c.down_channels
-        up1, up2, up3 = c.decoder_up_channels
-        dec1, dec2, dec3 = c.decoder_channels
-
-        enc1_skip = enc1 + c.encoder_blocks[0] * c.dense_inc
-        enc2_skip = enc2 + c.encoder_blocks[1] * c.dense_inc
-        enc3_skip = enc3 + c.encoder_blocks[2] * c.dense_inc
-        dec1_out = dec1 + c.decoder_blocks[0] * c.dense_inc
-        dec2_out = dec2 + c.decoder_blocks[1] * c.dense_inc
-        dec3_out = dec3 + c.decoder_blocks[2] * c.dense_inc
 
         self.stem = Stem(in_channels=in_channels, out_channels=c.stem_channels, factory=factory)
 
-        self.enc1 = DualPathStage(c.stem_channels, enc1, c.encoder_blocks[0], c.dense_inc, c.groups, factory)
-        self.down1 = DownsampleLayer(enc1_skip, down1, dense_inc=0, factory=factory)
-        self.enc2 = DualPathStage(down1, enc2, c.encoder_blocks[1], c.dense_inc, c.groups, factory)
-        self.down2 = DownsampleLayer(enc2_skip, down2, dense_inc=0, factory=factory)
-        self.enc3 = DualPathStage(down2, enc3, c.encoder_blocks[2], c.dense_inc, c.groups, factory)
-        self.att3 = SpatialSelfAttention(enc3_skip, c.encoder_attn_heads, factory)
-        self.down3 = DownsampleLayer(enc3_skip, down3, dense_inc=0, factory=factory)
+        num_stages = len(c.encoder_channels)
+        decoder_channels = c.decoder_channels or tuple(reversed(c.encoder_channels))
+
+        self.encoder_stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        self.skip_channels: list[int] = []
+
+        current_channels = c.stem_channels
+        for level, (res_channels, num_blocks) in enumerate(zip(c.encoder_channels, c.encoder_blocks)):
+            attn_heads = c.encoder_attn_heads if level in c.encoder_attn_levels else None
+            stage = AttentiveDualPathStage(
+                in_channels=current_channels,
+                res_channels=res_channels,
+                num_blocks=num_blocks,
+                dense_inc=c.dense_inc,
+                groups=c.groups,
+                factory=factory,
+                attn_heads=attn_heads
+            )
+            self.encoder_stages.append(stage)
+            current_channels = stage.out_channels
+            self.skip_channels.append(current_channels)
+
+            down_out_channels = c.encoder_channels[level + 1] if level < num_stages - 1 else c.bottleneck_channels
+            self.downsamples.append(
+                DownsampleLayer(current_channels, down_out_channels, dense_inc=0, factory=factory)
+            )
+            current_channels = down_out_channels
 
         self.bot_stage = BottleneckTransformerStage(
-            in_channels=down3,
-            out_channels=down3,
+            in_channels=c.bottleneck_channels,
+            out_channels=c.bottleneck_channels,
             inner_channels=c.bottleneck_inner_channels,
             num_layers=c.bottleneck_layers,
             num_heads=c.bottleneck_heads,
             factory=factory
         )
 
-        self.up1 = PixelShuffleUpsampleLayer(down3, up1, dense_inc=0, factory=factory)
-        self.fuse1 = FeatureFusionBlock(up1 + enc3_skip, dec1, factory=factory)
-        self.dec1 = DualPathStage(dec1, dec1, c.decoder_blocks[0], c.dense_inc, c.groups, factory)
-        self.dec1_att = SpatialSelfAttention(dec1_out, c.decoder_attn_heads, factory)
+        self.upsamples = nn.ModuleList()
+        self.fusions = nn.ModuleList()
+        self.decoder_stages = nn.ModuleList()
 
-        self.up2 = PixelShuffleUpsampleLayer(dec1_out, up2, dense_inc=0, factory=factory)
-        self.fuse2 = FeatureFusionBlock(up2 + enc2_skip, dec2, factory=factory)
-        self.dec2 = DualPathStage(dec2, dec2, c.decoder_blocks[1], c.dense_inc, c.groups, factory)
+        current_channels = c.bottleneck_channels
+        for level, (skip_channels, res_channels, num_blocks) in enumerate(
+                zip(reversed(self.skip_channels), decoder_channels, c.decoder_blocks)
+        ):
+            self.upsamples.append(
+                PixelShuffleUpsampleLayer(current_channels, res_channels, dense_inc=0, factory=factory)
+            )
+            self.fusions.append(
+                FeatureFusionBlock(res_channels + skip_channels, res_channels, factory=factory)
+            )
 
-        self.up3 = PixelShuffleUpsampleLayer(dec2_out, up3, dense_inc=0, factory=factory)
-        self.fuse3 = FeatureFusionBlock(up3 + enc1_skip, dec3, factory=factory)
-        self.dec3 = DualPathStage(dec3, dec3, c.decoder_blocks[2], c.dense_inc, c.groups, factory)
+            attn_heads = c.decoder_attn_heads if level in c.decoder_attn_levels else None
+            stage = AttentiveDualPathStage(
+                in_channels=res_channels,
+                res_channels=res_channels,
+                num_blocks=num_blocks,
+                dense_inc=c.dense_inc,
+                groups=c.groups,
+                factory=factory,
+                attn_heads=attn_heads
+            )
+            self.decoder_stages.append(stage)
+            current_channels = stage.out_channels
 
-        self.final = TimeAwareToRGB(in_channels=dec3_out, out_channels=out_channels, factory=factory)
+        self.final = TimeAwareToRGB(in_channels=current_channels, out_channels=out_channels, factory=factory)
 
         # 在初始化时缓存所有 CondConv 层，避免每次计算 loss 时遍历整个网络
         self.cond_conv_layers = [
             m for m in self.modules() if isinstance(m, TimeAwareCondConv2d)
         ]
 
+    def _validate_config(self):
+        c = self.config
+        num_stages = len(c.encoder_channels)
+        if num_stages == 0:
+            raise ValueError("encoder_channels must contain at least one stage.")
+        if len(c.encoder_blocks) != num_stages:
+            raise ValueError("encoder_blocks must have the same length as encoder_channels.")
+        if len(c.decoder_blocks) != num_stages:
+            raise ValueError("decoder_blocks must have the same length as encoder_channels.")
+        if c.decoder_channels is not None and len(c.decoder_channels) != num_stages:
+            raise ValueError("decoder_channels must be None or have the same length as encoder_channels.")
+        if c.attn_head_dim % 4 != 0:
+            raise ValueError("attn_head_dim must be divisible by 4 for RoPE2D.")
+
+        image_height, image_width = _to_2tuple(c.image_size, "image_size")
+        down_factor = 2 ** num_stages
+        if image_height % down_factor != 0 or image_width % down_factor != 0:
+            raise ValueError(f"image_size must be divisible by {down_factor}, got {(image_height, image_width)}.")
+
+        self._validate_attention_levels(c.encoder_attn_levels, num_stages, "encoder_attn_levels")
+        self._validate_attention_levels(c.decoder_attn_levels, num_stages, "decoder_attn_levels")
+
+        stage_channels = list(c.encoder_channels)
+        if c.decoder_channels is not None:
+            stage_channels.extend(c.decoder_channels)
+        stage_channels.append(c.bottleneck_channels)
+        for channels in stage_channels:
+            if channels % c.groups != 0:
+                raise ValueError(f"stage channel {channels} must be divisible by groups={c.groups}.")
+        if c.stem_channels < c.encoder_channels[0]:
+            raise ValueError("stem_channels must be >= the first encoder channel.")
+
+    @staticmethod
+    def _validate_attention_levels(levels: tuple[int, ...], num_stages: int, name: str):
+        invalid_levels = [level for level in levels if level < 0 or level >= num_stages]
+        if invalid_levels:
+            raise ValueError(f"{name} contains invalid levels {invalid_levels}; valid range is [0, {num_stages - 1}].")
+
     def forward(self, x, time):
         t_emb = self.time_mlp(time)
         x = self.stem(x, t_emb)
 
-        # Encoder
-        h1 = self.enc1(x, t_emb)
-        x = self.down1(h1, t_emb)
+        skips = []
+        for stage, downsample in zip(self.encoder_stages, self.downsamples):
+            x = stage(x, t_emb)
+            skips.append(x)
+            x = downsample(x, t_emb)
 
-        h2 = self.enc2(x, t_emb)
-        x = self.down2(h2, t_emb)
-
-        h3 = self.enc3(x, t_emb)
-        h3 = self.att3(h3, t_emb)
-        x = self.down3(h3, t_emb)
-
-        # Bottleneck
         x = self.bot_stage(x, t_emb)
 
-        # Decoder
-        # Layer 1
-        x = self.up1(x, t_emb)
-        x = torch.cat([x, h3], dim=1)
-        x = self.fuse1(x, t_emb)
-        x = self.dec1(x, t_emb)
-        x = self.dec1_att(x, t_emb)
-
-        # Layer 2
-        x = self.up2(x, t_emb)
-        x = torch.cat([x, h2], dim=1)
-        x = self.fuse2(x, t_emb)
-        x = self.dec2(x, t_emb)
-
-        # Layer 3
-        x = self.up3(x, t_emb)
-        x = torch.cat([x, h1], dim=1)
-        x = self.fuse3(x, t_emb)
-        x = self.dec3(x, t_emb)
+        for upsample, fusion, stage, skip in zip(
+                self.upsamples,
+                self.fusions,
+                self.decoder_stages,
+                reversed(skips)
+        ):
+            x = upsample(x, t_emb)
+            x = torch.cat([x, skip], dim=1)
+            x = fusion(x, t_emb)
+            x = stage(x, t_emb)
 
         return self.final(x, t_emb)
 
@@ -1198,20 +1309,22 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Testing on {device}")
 
-    # 1. 实例化模型
-    model = DiffusionTransUNet_64().to(device)
+    # 轻量自测使用小图，默认配置仍面向 512x512 训练。
+    test_config = TransUNetConfig(image_size=64, rope_max_size=64)
+    model = DiffusionTransUNet(config=test_config).to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total Parameters: {total_params / 1e6:.2f} M")
 
-    # 2. 模拟输入 (Batch Size=4, Channels=3, 64x64)
-    x = torch.randn(4, 3, 64, 64).to(device)
+    # 模拟输入 (Batch Size=1, Channels=3, 64x64)
+    image_height, image_width = _to_2tuple(test_config.image_size, "image_size")
+    x = torch.randn(1, 3, image_height, image_width).to(device)
 
-    # 3. 模拟时间步 (随机 t)
-    t = torch.randint(0, 1000, (4,)).to(device)
+    # 模拟时间步 (随机 t)
+    t = torch.randint(0, 1000, (x.shape[0],)).to(device)
 
-    # 4. 前向传播
+    # 前向传播
     try:
         output = model(x, t)
         print("Input shape:", x.shape)

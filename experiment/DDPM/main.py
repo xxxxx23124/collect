@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from experiment.DDPM.DataSets.catdataset_64 import CatDataset
-from experiment.DDPM.Model.TransUnetVer2 import DiffusionTransUNet_64
+from experiment.DDPM.Model.TransUnetVer2 import DiffusionTransUNet
 from experiment.DDPM.train import run_training
 
 
@@ -19,7 +19,7 @@ def main():
         return
 
     run_training(
-        model_cls=DiffusionTransUNet_64,
+        model_cls=DiffusionTransUNet,
         dataset=dataset,
         epochs=200,
         batch_size=128,
