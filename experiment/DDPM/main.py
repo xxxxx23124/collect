@@ -2,37 +2,67 @@ from pathlib import Path
 
 import torch
 
-from experiment.DDPM.DataSets.catdataset_64 import CatDataset
-from experiment.DDPM.Model.TransUnetVer2 import DiffusionTransUNet
+from experiment.DDPM.DataSets.fractal_dataset import FractalDataset
+from experiment.DDPM.Model.TransUnetVer2 import DiffusionTransUNet, TransUNetConfig
 from experiment.DDPM.train import run_training
 
 
 def main():
     project_dir = Path(__file__).resolve().parent
-    sample_dir = project_dir / "Ver2 image"
+    sample_dir = project_dir / "fractal_512_samples"
+    checkpoint_dir = project_dir / "fractal_512_checkpoints"
     sample_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    image_size = 64
-    dataset = CatDataset(image_size=image_size)
+    image_size = 512
+    dataset = FractalDataset(
+        image_size=image_size,
+        random_geometric_augment=True,
+    )
     if len(dataset) == 0:
-        print("没有找到猫猫头数据，请先检查 CatDataset 里的路径。")
+        print("没有找到 fractal 数据，请先运行 fractal_generator.py 或检查 FractalDataset 的路径。")
         return
+
+    model_config = TransUNetConfig(
+        image_size=image_size,
+        rope_max_size=image_size,
+        time_emb_dim=192,
+        time_hidden_dim=384,
+        time_layers=4,
+        num_experts=4,
+        dense_inc=12,
+        stem_channels=48,
+        encoder_channels=(48, 96, 192),
+        encoder_blocks=(1, 2, 2),
+        decoder_channels=(192, 96, 48),
+        decoder_blocks=(2, 2, 1),
+        bottleneck_channels=384,
+        bottleneck_inner_channels=512,
+        bottleneck_layers=3,
+        bottleneck_heads=8,
+        encoder_attn_levels=(),
+        decoder_attn_levels=(),
+    )
 
     run_training(
         model_cls=DiffusionTransUNet,
+        model_kwargs={"config": model_config},
         dataset=dataset,
         epochs=200,
-        batch_size=128,
-        accumulation_steps=2,
+        batch_size=32,
+        accumulation_steps=4,
         lr=2e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
         timesteps=1000,
         image_size=image_size,
         sample_dir=sample_dir,
-        sample_every=1,
+        checkpoint_dir=checkpoint_dir,
+        save_every_steps=5000,
+        sample_on_save=True,
+        sample_every=0,
         num_samples=4,
         num_workers=4,
-        save_model=False,
+        save_model=True,
         use_monitor=False,
     )
 
