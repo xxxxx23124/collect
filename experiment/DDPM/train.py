@@ -27,7 +27,7 @@ def run_training(
         save_every_steps=None,
         sample_on_save=True,
         sample_dir=".",
-        sample_every=1,
+        sample_every=None,
         num_samples=16,
         num_workers=4,
         use_monitor=False,
@@ -104,6 +104,9 @@ def run_training(
     accum_counter = 0
     global_step = 0
     next_save_step = save_every_steps if save_every_steps is not None and save_every_steps > 0 else None
+    next_sample_step = sample_every if sample_every is not None and sample_every > 0 else None
+    saved_any_checkpoint = False
+    last_sample_step = None
     stop_training = False
     optimizer.zero_grad(set_to_none=True)
 
@@ -112,6 +115,14 @@ def run_training(
     print(f"   Effective Batch Size: {batch_size * accumulation_steps}")
     print(f"   DDPM Timesteps: {timesteps}, Image Size: {image_size}")
     print(f"   Planned Optimizer Steps: {total_optimizer_steps}")
+    if next_save_step is not None:
+        print(f"   Checkpoint every {save_every_steps} optimizer steps")
+    elif save_model:
+        print("   Checkpoint every epoch")
+    if next_sample_step is not None:
+        print(f"   Sample every {sample_every} optimizer steps")
+    elif sample_on_save and (next_save_step is not None or save_model):
+        print("   Sample when checkpoint is saved")
 
     for epoch in range(epochs):
         ddpm.train()
@@ -161,9 +172,17 @@ def run_training(
                 if next_save_step is not None and global_step >= next_save_step:
                     print(f"💾 Save trigger reached at global_step={global_step}.")
                     save_checkpoint(epoch + 1, global_step)
-                    if sample_on_save:
+                    saved_any_checkpoint = True
+                    if sample_on_save and last_sample_step != global_step:
                         save_samples(global_step)
+                        last_sample_step = global_step
                     next_save_step += save_every_steps
+
+                if next_sample_step is not None and global_step >= next_sample_step:
+                    if last_sample_step != global_step:
+                        save_samples(global_step)
+                        last_sample_step = global_step
+                    next_sample_step += sample_every
 
                 if max_train_steps is not None and global_step >= max_train_steps:
                     stop_training = True
@@ -176,12 +195,18 @@ def run_training(
 
         if save_model and save_every_steps is None:
             save_checkpoint(epoch + 1, global_step)
-
-        if save_every_steps is None and sample_every > 0 and (epoch + 1) % sample_every == 0:
-            save_samples(global_step)
+            saved_any_checkpoint = True
+            if sample_on_save and last_sample_step != global_step:
+                save_samples(global_step)
+                last_sample_step = global_step
 
         if stop_training:
             break
+
+    if save_model and not saved_any_checkpoint:
+        save_checkpoint(epoch + 1, global_step)
+        if sample_on_save and last_sample_step != global_step:
+            save_samples(global_step)
 
     if use_monitor:
         monitor.close()
