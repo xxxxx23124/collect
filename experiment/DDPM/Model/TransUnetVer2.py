@@ -82,9 +82,6 @@ class Factory:
             fourier_scale=fourier_scale
         )
 
-    def get_timemlp(self, hidden_dim=512, num_layers=5, fourier_scale=16.0):
-        return self.get_time_mlp(hidden_dim, num_layers, fourier_scale)
-
     def get_act(self):
         return nn.SiLU()
 

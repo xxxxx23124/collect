@@ -14,7 +14,7 @@ def main():
     sample_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    image_size = 512
+    image_size = 128
     dataset = FractalDataset(
         image_size=image_size,
         random_geometric_augment=True,
