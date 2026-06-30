@@ -21,7 +21,7 @@ class TransUNetConfig:
     groups: int = 4
     dense_inc: int = 8
     stem_channels: int = 32
-    encoder_channels: tuple[int, ...] = (32, 64, 128)
+    encoder_channels: tuple[int, ...] = (32, 64, 112)
     encoder_blocks: tuple[int, ...] = (1, 1, 2)
     decoder_blocks: tuple[int, ...] = (2, 1, 1)
     decoder_channels: tuple[int, ...] | None = None
@@ -31,8 +31,8 @@ class TransUNetConfig:
     bottleneck_heads: int = 8
     encoder_attn_levels: tuple[int, ...] = (2,)
     decoder_attn_levels: tuple[int, ...] = (0,)
-    encoder_attn_heads: int = 5
-    decoder_attn_heads: int = 7
+    encoder_attn_heads: int = 4
+    decoder_attn_heads: int = 4
     ortho_weight: float = 1e-6
     router_temperature: float = 1.0
     router_balance_weight: float = 1e-6
@@ -1289,6 +1289,8 @@ class DiffusionTransUNet(nn.Module):
             raise ValueError("decoder_blocks must have the same length as encoder_channels.")
         if c.decoder_channels is not None and len(c.decoder_channels) != num_stages:
             raise ValueError("decoder_channels must be None or have the same length as encoder_channels.")
+        if c.attn_head_dim <= 0:
+            raise ValueError("attn_head_dim must be positive.")
         if c.attn_head_dim % 4 != 0:
             raise ValueError("attn_head_dim must be divisible by 4 for RoPE2D.")
         if c.router_temperature <= 0:
@@ -1306,6 +1308,36 @@ class DiffusionTransUNet(nn.Module):
         self._validate_attention_levels(c.encoder_attn_levels, num_stages, "encoder_attn_levels")
         self._validate_attention_levels(c.decoder_attn_levels, num_stages, "decoder_attn_levels")
 
+        decoder_channels = c.decoder_channels or tuple(reversed(c.encoder_channels))
+        self._validate_attention_width(
+            channels=c.bottleneck_inner_channels,
+            num_heads=c.bottleneck_heads,
+            head_dim=c.attn_head_dim,
+            name="bottleneck attention"
+        )
+
+        current_channels = c.stem_channels
+        for level, num_blocks in enumerate(c.encoder_blocks):
+            attn_channels = current_channels + num_blocks * c.dense_inc
+            if level in c.encoder_attn_levels:
+                self._validate_attention_width(
+                    channels=attn_channels,
+                    num_heads=c.encoder_attn_heads,
+                    head_dim=c.attn_head_dim,
+                    name=f"encoder attention level {level}"
+                )
+            current_channels = c.encoder_channels[level + 1] if level < num_stages - 1 else c.bottleneck_channels
+
+        for level, (res_channels, num_blocks) in enumerate(zip(decoder_channels, c.decoder_blocks)):
+            if level not in c.decoder_attn_levels:
+                continue
+            self._validate_attention_width(
+                channels=res_channels + num_blocks * c.dense_inc,
+                num_heads=c.decoder_attn_heads,
+                head_dim=c.attn_head_dim,
+                name=f"decoder attention level {level}"
+            )
+
         stage_channels = list(c.encoder_channels)
         if c.decoder_channels is not None:
             stage_channels.extend(c.decoder_channels)
@@ -1321,6 +1353,23 @@ class DiffusionTransUNet(nn.Module):
         invalid_levels = [level for level in levels if level < 0 or level >= num_stages]
         if invalid_levels:
             raise ValueError(f"{name} contains invalid levels {invalid_levels}; valid range is [0, {num_stages - 1}].")
+
+    @staticmethod
+    def _validate_attention_width(channels: int, num_heads: int, head_dim: int, name: str):
+        if num_heads <= 0:
+            raise ValueError(f"{name} num_heads must be positive, got {num_heads}.")
+        expected_heads, remainder = divmod(channels, head_dim)
+        if remainder != 0:
+            raise ValueError(
+                f"{name} channels must be divisible by attn_head_dim; "
+                f"got channels={channels}, attn_head_dim={head_dim}, remainder={remainder}."
+            )
+        if num_heads != expected_heads:
+            raise ValueError(
+                f"{name} expects num_heads * attn_head_dim == channels; "
+                f"got {num_heads} * {head_dim} = {num_heads * head_dim}, channels={channels}. "
+                f"Set num_heads to {expected_heads} for attn_head_dim={head_dim}."
+            )
 
     def forward(self, x, time):
         t_emb = self.time_mlp(time)
