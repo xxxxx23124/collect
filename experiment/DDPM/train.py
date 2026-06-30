@@ -36,6 +36,10 @@ def run_training(
 ):
     model_kwargs = model_kwargs or {}
     unet = model_cls(**model_kwargs)
+
+    total_params = sum(p.numel() for p in unet.parameters())
+    print(f"Total Parameters: {total_params / 1e6:.2f} M")
+
     ddpm = DDPM(
         model=unet,
         timesteps=timesteps,
