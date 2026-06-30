@@ -40,7 +40,7 @@ def main():
         bottleneck_inner_channels=512,
         bottleneck_layers=3,
         bottleneck_heads=8,
-        encoder_attn_levels=(2,)
+        encoder_attn_levels=(2,),
         decoder_attn_levels=(0,)
     )
 
