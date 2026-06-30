@@ -90,7 +90,7 @@ def run_training(
         print("🎨 Sampling images...")
         generated_imgs = ddpm.sample(num_samples=num_samples, img_size=image_size)
         sample_path = sample_dir / f"sample_step_{global_step:06d}.png"
-        save_image(generated_imgs, sample_path, nrow=max(1, min(4, num_samples)))
+        save_image(generated_imgs, sample_path, nrow=max(1, min(16, num_samples)))
         print(f"✅ Saved sample to {sample_path}")
 
     # 4. 训练循环
