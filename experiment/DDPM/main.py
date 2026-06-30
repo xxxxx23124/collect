@@ -9,12 +9,12 @@ from experiment.DDPM.train import run_training
 
 def main():
     project_dir = Path(__file__).resolve().parent
-    sample_dir = project_dir / "fractal_512_samples"
-    checkpoint_dir = project_dir / "fractal_512_checkpoints"
+    image_size = 128
+    sample_dir = project_dir / f"fractal_{image_size}_samples"
+    checkpoint_dir = project_dir / f"fractal_{image_size}_checkpoints"
     sample_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    image_size = 128
     dataset = FractalDataset(
         image_size=image_size,
         random_geometric_augment=True,
@@ -40,24 +40,24 @@ def main():
         bottleneck_inner_channels=512,
         bottleneck_layers=3,
         bottleneck_heads=8,
-        encoder_attn_levels=(),
-        decoder_attn_levels=(),
+        encoder_attn_levels=(2,)
+        decoder_attn_levels=(0,)
     )
 
     run_training(
         model_cls=DiffusionTransUNet,
         model_kwargs={"config": model_config},
         dataset=dataset,
-        epochs=200,
-        batch_size=32,
-        accumulation_steps=4,
+        epochs=50,
+        batch_size=28,
+        accumulation_steps=5,
         lr=2e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
         timesteps=1000,
         image_size=image_size,
         sample_dir=sample_dir,
         checkpoint_dir=checkpoint_dir,
-        save_every_steps=5000,
+        save_every_steps=1000,
         sample_on_save=True,
         sample_every=0,
         num_samples=4,

@@ -15,7 +15,7 @@ def run_training(
         dataset,
         epochs=200,
         batch_size=64,
-        accumulation_steps=4,  # 累积几步更新一次
+        accumulation_steps=4,
         lr=2e-4,
         device="cuda",
         timesteps=300,
@@ -33,12 +33,10 @@ def run_training(
         use_monitor=False,
         max_train_steps=None,
 ):
-    # 1. 初始化模型和 DDPM
     model_kwargs = model_kwargs or {}
     unet = model_cls(**model_kwargs)
     ddpm = DDPM(model=unet, timesteps=timesteps).to(device)
 
-    # 2. 数据加载器
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     dataloader = DataLoader(
         dataset,
@@ -50,7 +48,6 @@ def run_training(
         persistent_workers=num_workers > 0,
     )
 
-    # 3. 优化器和调度器
     optimizer = optim.AdamW(ddpm.parameters(), lr=lr, weight_decay=0)
     sample_dir = Path(sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -100,6 +97,7 @@ def run_training(
     batch_loss = 0
     accum_counter = 0
     global_step = 0
+    next_save_step = save_every_steps if save_every_steps is not None and save_every_steps > 0 else None
     stop_training = False
     optimizer.zero_grad(set_to_none=True)
 
@@ -115,8 +113,6 @@ def run_training(
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
 
         for step, batch in enumerate(progress_bar):
-            # 假设 dataset 返回的是 (image, label) 或者 image
-            # 我们只需要 image
             if isinstance(batch, (list, tuple)):
                 images = batch[0]
             else:
@@ -127,33 +123,21 @@ def run_training(
             # 重要：DDPM 假设输入在 [-1, 1]，如果 DataLoader 输出是 [0, 1]，需要转换
             # images = images * 2.0 - 1.0
 
-            # ================= 1. 计算主 Loss (依赖数据) =================
             loss_main = ddpm.compute_loss(images)
-
-            # 梯度累积
-            # 除以累积步数，因为 backward 会累加梯度
             loss_main = loss_main / accumulation_steps
-            # 反向传播主 Loss
             loss_main.backward()
 
-            # 还原主 Loss 数值用于打印
             loss_val = loss_main.item() * accumulation_steps
             epoch_loss += loss_val
-
-            # 用于日志记录 (还原数值)
-            batch_loss += loss_main.item()
-
-            # 计数器 +1
+            batch_loss += loss_val
             accum_counter += 1
 
-            # 只有满足累积步数时才进行更新
             if accum_counter % accumulation_steps == 0:
-                # 正则化 Loss 只与权重有关，与 Batch 大小无关，
-                # 所以不需要除以 accumulation_steps，直接加一次梯度即可。
-                aux_loss = unet.get_auxiliary_loss()
-                aux_loss.backward()
+                # 权重正交正则与 batch 无关，只在 optimizer step 前额外反传一次。
+                if hasattr(unet, "get_auxiliary_loss"):
+                    aux_loss = unet.get_auxiliary_loss()
+                    aux_loss.backward()
 
-                # 梯度裁剪 (Max Norm 通常设为 1.0)
                 torch.nn.utils.clip_grad_norm_(ddpm.parameters(), max_norm=1.0)
 
                 optimizer.step()
@@ -162,21 +146,18 @@ def run_training(
                 global_step += 1
 
                 if use_monitor:
-                    # 此时 monitor.batch_buffer 里已经攒了 N 个 mini-batch 的数据
-                    # 调用 log_and_reset 进行结算、记录并清空
                     monitor.log_and_reset(global_step)
-
-                    # 顺便记录一下 Loss 和 LR
                     monitor.writer.add_scalar("Train/Loss", batch_loss, global_step)
                     monitor.writer.add_scalar("Train/LR", optimizer.param_groups[0]['lr'], global_step)
 
-                # 重置累积的 batch_loss
                 batch_loss = 0
 
-                if save_every_steps is not None and save_every_steps > 0 and global_step % save_every_steps == 0:
+                if next_save_step is not None and global_step >= next_save_step:
+                    print(f"💾 Save trigger reached at global_step={global_step}.")
                     save_checkpoint(epoch + 1, global_step)
                     if sample_on_save:
                         save_samples(global_step)
+                    next_save_step += save_every_steps
 
                 if max_train_steps is not None and global_step >= max_train_steps:
                     stop_training = True

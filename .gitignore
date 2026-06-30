@@ -89,3 +89,4 @@ mlruns/
 # Generated DDPM fractal dataset
 experiment/DDPM/generated_fractals/
 /experiment/DDPM/.numba_cache
+/experiment/DDPM/__pycache__

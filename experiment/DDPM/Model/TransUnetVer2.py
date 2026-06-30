@@ -33,6 +33,10 @@ class TransUNetConfig:
     decoder_attn_levels: tuple[int, ...] = (0,)
     encoder_attn_heads: int = 5
     decoder_attn_heads: int = 7
+    ortho_weight: float = 1e-6
+    router_temperature: float = 1.0
+    router_balance_weight: float = 1e-6
+    router_entropy_weight: float = 0.0
 
 
 def _to_2tuple(value: int | tuple[int, int], name: str) -> tuple[int, int]:
@@ -50,10 +54,12 @@ class Factory:
                  attn_head_dim=64,
                  rope_height=256,
                  rope_width=256,
-                 rope_base=500.0,):
+                 rope_base=500.0,
+                 router_temperature=1.0,):
         self.time_emb_dim = time_emb_dim
         self.convolution_kernel_group = convolution_kernel_group
         self.attn_head_dim = attn_head_dim
+        self.router_temperature = router_temperature
         self.rope = RoPE2D(
             dim=self.attn_head_dim,
             height=rope_height,
@@ -71,7 +77,8 @@ class Factory:
             padding=padding,
             groups=groups,
             bias=bias,
-            num_experts=self.convolution_kernel_group
+            num_experts=self.convolution_kernel_group,
+            router_temperature=self.router_temperature
         )
 
     def get_time_mlp(self, hidden_dim=512, num_layers=5, fourier_scale=16.0):
@@ -379,7 +386,8 @@ class TimeAwareCondConv2d(nn.Module):
                  groups: int = 1,
                  bias: bool = False,
                  num_experts: int = 4,
-                 gating_noise_std: float = 1e-2, ):
+                 gating_noise_std: float = 1e-2,
+                 router_temperature: float = 1.0, ):
         super().__init__()
 
         assert in_channels % groups == 0, "in_channels must be divisible by groups."
@@ -394,6 +402,10 @@ class TimeAwareCondConv2d(nn.Module):
         self.groups = groups
         self.num_experts = num_experts
         self.gating_noise_std = gating_noise_std
+        self.router_temperature = router_temperature
+
+        if self.router_temperature <= 0:
+            raise ValueError("router_temperature must be positive.")
 
         self.weight = nn.Parameter(
             torch.randn(num_experts, out_channels, in_channels // groups, self.kernel_size, self.kernel_size)
@@ -407,6 +419,7 @@ class TimeAwareCondConv2d(nn.Module):
         self.router = CondConvRouter(in_channels, time_emb_dim, num_experts)
         ortho_mask = torch.ones(num_experts, num_experts) - torch.eye(num_experts)
         self.register_buffer("ortho_offdiag_mask", ortho_mask)
+        self._last_routing_weights: torch.Tensor | None = None
 
         self._init_weights()
 
@@ -433,9 +446,29 @@ class TimeAwareCondConv2d(nn.Module):
 
         return off_diag.square().mean()
 
+    def get_router_loss(self, balance_weight=1e-6, entropy_weight=0.0):
+        routing_weights = self._last_routing_weights
+        if routing_weights is None:
+            return None
+
+        loss = routing_weights.new_zeros(())
+
+        if balance_weight > 0:
+            avg_prob = routing_weights.mean(dim=0)
+            target = torch.full_like(avg_prob, 1.0 / self.num_experts)
+            loss = loss + balance_weight * F.mse_loss(avg_prob, target)
+
+        if entropy_weight > 0:
+            probs = routing_weights.clamp_min(1e-8)
+            entropy = -(probs * probs.log()).sum(dim=1).mean()
+            loss = loss + entropy_weight * (math.log(self.num_experts) - entropy)
+
+        return loss
+
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         routing_logits = self.router(x, time_emb)
-        routing_weights = F.softmax(routing_logits, dim=1)
+        routing_weights = F.softmax(routing_logits / self.router_temperature, dim=1)
+        self._last_routing_weights = routing_weights if self.training else None
 
         out = None
         for expert_idx in range(self.num_experts):
@@ -869,6 +902,7 @@ class SpatialSelfAttention(nn.Module):
             channels=channels,
             num_heads=num_heads,
         )
+        self.layer_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -878,7 +912,7 @@ class SpatialSelfAttention(nn.Module):
         x_norm = self.rms(x_flat, time_emb)
         out = self.attn(x_norm, height=H, width=W)
         out = out.transpose(1, 2).reshape(B, C, H, W)
-        return residual + out
+        return residual + out * self.layer_scale.view(1, C, 1, 1)
 
 
 class TimeAwareIdentity(nn.Module):
@@ -930,11 +964,13 @@ class TransformerBlock(nn.Module):
         self.rms1 = factory.get_rms(channels=channels)
 
         self.attn = factory.get_selfattn(channels=channels, num_heads=num_heads)
+        self.attn_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
 
         self.rms2 = factory.get_rms(channels=channels)
 
         inner_channels = int(channels * ffn_mult)
         self.ffn = factory.get_swiglu(channels=channels, inner_channels=inner_channels)
+        self.ffn_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
 
     def forward(self,
                 x: torch.Tensor,
@@ -942,8 +978,8 @@ class TransformerBlock(nn.Module):
                 height: int | None = None,
                 width: int | None = None) -> torch.Tensor:
 
-        x = x + self.attn(self.rms1(x, time_emb), height=height, width=width)
-        x = x + self.ffn(self.rms2(x, time_emb), time_emb)
+        x = x + self.attn(self.rms1(x, time_emb), height=height, width=width) * self.attn_scale.view(1, 1, -1)
+        x = x + self.ffn(self.rms2(x, time_emb), time_emb) * self.ffn_scale.view(1, 1, -1)
         return x
 
 
@@ -966,7 +1002,7 @@ class CrossFusionBlock(nn.Module):
         )
         self.gate_init_bias = gate_init_bias
         self.layer_scale = nn.Parameter(1e-2 * torch.ones(channels), requires_grad=True)
-        self.query_mix = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.query_mix = nn.Parameter(torch.zeros(channels), requires_grad=True)
 
     def forward(self,
                 cnn_tokens: torch.Tensor,
@@ -975,7 +1011,7 @@ class CrossFusionBlock(nn.Module):
                 height: int,
                 width: int) -> torch.Tensor:
         B, N, C = state_tokens.shape
-        query_tokens = cnn_tokens + self.query_mix * (state_tokens - cnn_tokens)
+        query_tokens = cnn_tokens + self.query_mix.view(1, 1, C) * (state_tokens - cnn_tokens)
         query_map = query_tokens.transpose(1, 2).reshape(B, C, height, width)
         cross_tokens = self.cross_attn(
             self.q_norm(query_tokens, time_emb),
@@ -1043,7 +1079,7 @@ class BottleneckTransformerStage(nn.Module):
             bias=False
         )
 
-        self.trans_scale = nn.Parameter(torch.tensor(1e-2), requires_grad=True)
+        self.trans_scale = nn.Parameter(1e-2 * torch.ones(inner_channels), requires_grad=True)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         def main_path(x_in: torch.Tensor, time_emb_in: torch.Tensor) -> torch.Tensor:
@@ -1063,7 +1099,7 @@ class BottleneckTransformerStage(nn.Module):
                 )
 
             out = state_tokens.transpose(1, 2).reshape(B, C, H, W)
-            out = x_feat + self.trans_scale * (out - x_feat)
+            out = x_feat + self.trans_scale.view(1, C, 1, 1) * (out - x_feat)
             out = self.proj_out(out, time_emb_in)
 
             return out
@@ -1144,7 +1180,8 @@ class DiffusionTransUNet(nn.Module):
             attn_head_dim=c.attn_head_dim,
             rope_height=rope_height,
             rope_width=rope_width,
-            rope_base=c.rope_base
+            rope_base=c.rope_base,
+            router_temperature=c.router_temperature
         )
         self.time_mlp = factory.get_time_mlp(
             hidden_dim=c.time_hidden_dim,
@@ -1239,6 +1276,12 @@ class DiffusionTransUNet(nn.Module):
             raise ValueError("decoder_channels must be None or have the same length as encoder_channels.")
         if c.attn_head_dim % 4 != 0:
             raise ValueError("attn_head_dim must be divisible by 4 for RoPE2D.")
+        if c.router_temperature <= 0:
+            raise ValueError("router_temperature must be positive.")
+        if c.ortho_weight < 0:
+            raise ValueError("ortho_weight must be non-negative.")
+        if c.router_balance_weight < 0 or c.router_entropy_weight < 0:
+            raise ValueError("router auxiliary weights must be non-negative.")
 
         image_height, image_width = _to_2tuple(c.image_size, "image_size")
         down_factor = 2 ** num_stages
@@ -1289,16 +1332,35 @@ class DiffusionTransUNet(nn.Module):
 
         return self.final(x, t_emb)
 
-    def get_auxiliary_loss(self, ortho_weight=1e-6):
-        """
-        在计算主 Loss后，调用此函数获取额外的正则化 Loss。
-        total_loss = mse_loss + aux_loss
-        """
-        ortho_loss_total = 0.0
+    def get_auxiliary_loss(self, ortho_weight=None):
+        ortho_weight = self.config.ortho_weight if ortho_weight is None else ortho_weight
+        if ortho_weight <= 0:
+            return next(self.parameters()).new_zeros(())
+
+        ortho_loss_total = next(self.parameters()).new_zeros(())
         for module in self.cond_conv_layers:
             ortho_loss_total += module.get_ortho_loss()
 
         return ortho_weight * ortho_loss_total
+
+    def get_router_auxiliary_loss(self, balance_weight=None, entropy_weight=None):
+        c = self.config
+        balance_weight = c.router_balance_weight if balance_weight is None else balance_weight
+        entropy_weight = c.router_entropy_weight if entropy_weight is None else entropy_weight
+
+        if balance_weight <= 0 and entropy_weight <= 0:
+            return next(self.parameters()).new_zeros(())
+
+        router_loss_total = next(self.parameters()).new_zeros(())
+        for module in self.cond_conv_layers:
+            router_loss = module.get_router_loss(
+                balance_weight=balance_weight,
+                entropy_weight=entropy_weight
+            )
+            if router_loss is not None:
+                router_loss_total = router_loss_total + router_loss
+
+        return router_loss_total
 
 
 # ================= 测试代码 =================
@@ -1319,7 +1381,8 @@ if __name__ == "__main__":
     x = torch.randn(1, 3, image_height, image_width).to(device)
 
     # 模拟时间步 (随机 t)
-    t = torch.randint(0, 1000, (x.shape[0],)).to(device)
+    test_timesteps = 1000
+    t = torch.randint(0, test_timesteps, (x.shape[0],), device=device).float() / test_timesteps
 
     # 前向传播
     try:
