@@ -32,10 +32,15 @@ def run_training(
         num_workers=4,
         use_monitor=False,
         max_train_steps=None,
+        use_router_auxiliary_loss=True,
 ):
     model_kwargs = model_kwargs or {}
     unet = model_cls(**model_kwargs)
-    ddpm = DDPM(model=unet, timesteps=timesteps).to(device)
+    ddpm = DDPM(
+        model=unet,
+        timesteps=timesteps,
+        use_router_auxiliary_loss=use_router_auxiliary_loss,
+    ).to(device)
 
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     dataloader = DataLoader(
@@ -80,6 +85,7 @@ def run_training(
                 "image_size": image_size,
                 "batch_size": batch_size,
                 "accumulation_steps": accumulation_steps,
+                "use_router_auxiliary_loss": use_router_auxiliary_loss,
                 "model_kwargs": model_kwargs,
             },
             checkpoint_path,

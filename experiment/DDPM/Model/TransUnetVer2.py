@@ -37,6 +37,7 @@ class TransUNetConfig:
     router_temperature: float = 1.0
     router_balance_weight: float = 1e-6
     router_entropy_weight: float = 0.0
+    collect_router_auxiliary_loss: bool = True
 
 
 def _to_2tuple(value: int | tuple[int, int], name: str) -> tuple[int, int]:
@@ -55,11 +56,13 @@ class Factory:
                  rope_height=256,
                  rope_width=256,
                  rope_base=500.0,
-                 router_temperature=1.0,):
+                 router_temperature=1.0,
+                 collect_router_auxiliary_loss=True,):
         self.time_emb_dim = time_emb_dim
         self.convolution_kernel_group = convolution_kernel_group
         self.attn_head_dim = attn_head_dim
         self.router_temperature = router_temperature
+        self.collect_router_auxiliary_loss = collect_router_auxiliary_loss
         self.rope = RoPE2D(
             dim=self.attn_head_dim,
             height=rope_height,
@@ -78,7 +81,8 @@ class Factory:
             groups=groups,
             bias=bias,
             num_experts=self.convolution_kernel_group,
-            router_temperature=self.router_temperature
+            router_temperature=self.router_temperature,
+            collect_router_auxiliary_loss=self.collect_router_auxiliary_loss
         )
 
     def get_time_mlp(self, hidden_dim=512, num_layers=5, fourier_scale=16.0):
@@ -387,7 +391,8 @@ class TimeAwareCondConv2d(nn.Module):
                  bias: bool = False,
                  num_experts: int = 4,
                  gating_noise_std: float = 1e-2,
-                 router_temperature: float = 1.0, ):
+                 router_temperature: float = 1.0,
+                 collect_router_auxiliary_loss: bool = True, ):
         super().__init__()
 
         assert in_channels % groups == 0, "in_channels must be divisible by groups."
@@ -403,6 +408,7 @@ class TimeAwareCondConv2d(nn.Module):
         self.num_experts = num_experts
         self.gating_noise_std = gating_noise_std
         self.router_temperature = router_temperature
+        self.collect_router_auxiliary_loss = collect_router_auxiliary_loss
 
         if self.router_temperature <= 0:
             raise ValueError("router_temperature must be positive.")
@@ -446,6 +452,11 @@ class TimeAwareCondConv2d(nn.Module):
 
         return off_diag.square().mean()
 
+    def set_router_auxiliary_loss_enabled(self, enabled: bool):
+        self.collect_router_auxiliary_loss = bool(enabled)
+        if not self.collect_router_auxiliary_loss:
+            self._last_routing_weights = None
+
     def get_router_loss(self, balance_weight=1e-6, entropy_weight=0.0):
         routing_weights = self._last_routing_weights
         if routing_weights is None:
@@ -468,7 +479,10 @@ class TimeAwareCondConv2d(nn.Module):
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         routing_logits = self.router(x, time_emb)
         routing_weights = F.softmax(routing_logits / self.router_temperature, dim=1)
-        self._last_routing_weights = routing_weights if self.training else None
+        if self.training and self.collect_router_auxiliary_loss:
+            self._last_routing_weights = routing_weights
+        else:
+            self._last_routing_weights = None
 
         out = None
         for expert_idx in range(self.num_experts):
@@ -1181,7 +1195,8 @@ class DiffusionTransUNet(nn.Module):
             rope_height=rope_height,
             rope_width=rope_width,
             rope_base=c.rope_base,
-            router_temperature=c.router_temperature
+            router_temperature=c.router_temperature,
+            collect_router_auxiliary_loss=c.collect_router_auxiliary_loss
         )
         self.time_mlp = factory.get_time_mlp(
             hidden_dim=c.time_hidden_dim,
@@ -1332,6 +1347,12 @@ class DiffusionTransUNet(nn.Module):
 
         return self.final(x, t_emb)
 
+    def set_router_auxiliary_loss_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        self.config.collect_router_auxiliary_loss = enabled
+        for module in self.cond_conv_layers:
+            module.set_router_auxiliary_loss_enabled(enabled)
+
     def get_auxiliary_loss(self, ortho_weight=None):
         ortho_weight = self.config.ortho_weight if ortho_weight is None else ortho_weight
         if ortho_weight <= 0:
@@ -1345,6 +1366,9 @@ class DiffusionTransUNet(nn.Module):
 
     def get_router_auxiliary_loss(self, balance_weight=None, entropy_weight=None):
         c = self.config
+        if not c.collect_router_auxiliary_loss:
+            return next(self.parameters()).new_zeros(())
+
         balance_weight = c.router_balance_weight if balance_weight is None else balance_weight
         entropy_weight = c.router_entropy_weight if entropy_weight is None else entropy_weight
 

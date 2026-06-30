@@ -10,11 +10,15 @@ class DDPM(nn.Module):
                  timesteps=1000,
                  beta_start=1e-4,
                  beta_end=0.02,
-                 use_fixed_small=True,):
+                 use_fixed_small=True,
+                 use_router_auxiliary_loss=True,):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
         self.use_fixed_small = use_fixed_small
+        self.use_router_auxiliary_loss = bool(use_router_auxiliary_loss)
+        if hasattr(self.model, "set_router_auxiliary_loss_enabled"):
+            self.model.set_router_auxiliary_loss_enabled(self.use_router_auxiliary_loss)
 
         beta = torch.linspace(beta_start, beta_end, timesteps)
         alpha = 1.0 - beta
@@ -50,6 +54,11 @@ class DDPM(nn.Module):
         # TimeMLP 使用连续时间输入，这里统一映射到 [0, 1]。
         return t.float() / self.timesteps
 
+    def set_router_auxiliary_loss_enabled(self, enabled: bool):
+        self.use_router_auxiliary_loss = bool(enabled)
+        if hasattr(self.model, "set_router_auxiliary_loss_enabled"):
+            self.model.set_router_auxiliary_loss_enabled(self.use_router_auxiliary_loss)
+
     def extract(self, a, t, x_shape):
         batch_size = t.shape[0]
         out = a.gather(-1, t)
@@ -75,7 +84,7 @@ class DDPM(nn.Module):
         predicted_noise = self.model(x_t, self.normalize_time(t))
 
         loss = F.mse_loss(predicted_noise, noise)
-        if hasattr(self.model, "get_router_auxiliary_loss"):
+        if self.use_router_auxiliary_loss and hasattr(self.model, "get_router_auxiliary_loss"):
             # Router 正则依赖当前 batch 的 routing graph，必须随主 loss 一起反传。
             loss = loss + self.model.get_router_auxiliary_loss()
 

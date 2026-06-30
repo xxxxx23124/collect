@@ -41,7 +41,8 @@ def main():
         bottleneck_layers=3,
         bottleneck_heads=8,
         encoder_attn_levels=(2,),
-        decoder_attn_levels=(0,)
+        decoder_attn_levels=(0,),
+        collect_router_auxiliary_loss=False,
     )
 
     run_training(
@@ -64,6 +65,7 @@ def main():
         num_workers=4,
         save_model=True,
         use_monitor=False,
+        use_router_auxiliary_loss=False,
     )
 
 
